@@ -1,0 +1,26 @@
+project: mini-hrms
+release: v0.1.0-rc1
+target_environment: staging
+ci:
+  status: pass
+  checks:
+    - backend-tests
+    - frontend-tests
+    - lint
+    - typecheck
+    - build
+tests:
+  status: pass
+  total: 128
+review:
+  status: approved
+  reviewer: qa-reviewer
+security:
+  status: pass
+  critical_findings: 0
+  high_findings: 0
+traceability_complete: true
+residual_risks:
+  - Production load testing is not included in the MVP pilot.
+approvals:
+  production_deployment: false

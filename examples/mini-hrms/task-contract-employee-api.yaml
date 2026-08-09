@@ -1,0 +1,40 @@
+id: HRMS-BE-001
+title: Implement employee API with RBAC
+goal: Provide employee read/write endpoints that enforce HR, Manager, and Employee permissions.
+inputs:
+  - HRMS Product Spec
+  - Architecture API contract
+  - Employee data model
+outputs:
+  - Employee API implementation
+  - Unit tests
+  - Integration tests
+acceptance_criteria:
+  - HR can create and update employees
+  - Employee can view self
+  - Manager can view authorized team members
+  - Unauthorized access is denied without leaking employee data
+  - Audit event is emitted for HR updates
+verification:
+  - pytest tests/employees -q
+  - ruff check .
+risk: high
+assignee_role: engineer
+constraints:
+  - Do not add payroll fields
+  - Preserve documented API response shape
+boundaries:
+  - backend/employees
+  - backend/auth
+  - tests/employees
+review:
+  required: true
+  profile: qa-reviewer
+security:
+  required: true
+  profile: qa-reviewer
+traceability:
+  requirement_ids:
+    - HRMS-REQ-001
+    - HRMS-REQ-002
+    - HRMS-REQ-005

@@ -1,0 +1,29 @@
+default: human_approval
+
+actions:
+  research: autonomous
+  market_research: autonomous
+  user_research: autonomous
+  requirements: autonomous
+  product_specification: autonomous
+  architecture: autonomous
+  coding: autonomous
+  testing: autonomous
+  documentation: autonomous
+  refactoring: autonomous
+  create_branch: autonomous
+  create_pull_request: autonomous
+  staging_deployment: autonomous
+
+  production_deployment: human_approval
+  destructive_database_migration: human_approval
+  credential_change: human_approval
+  paid_service_purchase: human_approval
+  major_scope_change: human_approval
+  security_exception: human_approval
+  production_database_write: human_approval
+
+  direct_push_main: forbidden
+  bypass_required_review: forbidden
+  disable_security_controls: forbidden
+  expose_credentials: forbidden

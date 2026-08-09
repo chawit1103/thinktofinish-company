@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thinktofinish.local/schemas/release-evidence.schema.json",
+  "title": "ThinkToFinish Release Evidence",
+  "type": "object",
+  "required": [
+    "project",
+    "release",
+    "target_environment",
+    "ci",
+    "tests",
+    "review",
+    "security",
+    "traceability_complete",
+    "residual_risks"
+  ],
+  "properties": {
+    "project": {"type": "string"},
+    "release": {"type": "string"},
+    "target_environment": {"enum": ["development", "staging", "production"]},
+    "ci": {"type": "object"},
+    "tests": {"type": "object"},
+    "review": {"type": "object"},
+    "security": {"type": "object"},
+    "traceability_complete": {"type": "boolean"},
+    "residual_risks": {"type": "array"},
+    "approvals": {"type": "object"}
+  },
+  "additionalProperties": true
+}

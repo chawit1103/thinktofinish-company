@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thinktofinish.local/schemas/task-contract.schema.json",
+  "title": "ThinkToFinish Company Task Contract",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "goal",
+    "inputs",
+    "outputs",
+    "acceptance_criteria",
+    "verification",
+    "risk",
+    "assignee_role"
+  ],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "minLength": 1},
+    "goal": {"type": "string", "minLength": 1},
+    "inputs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "outputs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "acceptance_criteria": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "verification": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "risk": {"enum": ["low", "medium", "high", "critical"]},
+    "assignee_role": {"type": "string", "minLength": 1},
+    "constraints": {"type": "array", "items": {"type": "string"}},
+    "boundaries": {"type": "array", "items": {"type": "string"}},
+    "review": {
+      "type": "object",
+      "properties": {
+        "required": {"type": "boolean"},
+        "profile": {"type": "string"}
+      }
+    },
+    "security": {
+      "type": "object",
+      "properties": {
+        "required": {"type": "boolean"},
+        "profile": {"type": "string"}
+      }
+    },
+    "traceability": {
+      "type": "object",
+      "properties": {
+        "requirement_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "additionalProperties": true
+}

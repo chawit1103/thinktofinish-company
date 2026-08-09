@@ -1,0 +1,27 @@
+project: mini-hrms
+requirements:
+  - id: HRMS-REQ-001
+    title: Employee self view
+    acceptance:
+      - An authenticated employee can view their own employee record.
+      - An employee cannot view another employee unless authorized by role.
+  - id: HRMS-REQ-002
+    title: HR employee administration
+    acceptance:
+      - HR can create and update employee records.
+      - Changes create an audit event.
+  - id: HRMS-REQ-003
+    title: Leave request
+    acceptance:
+      - Employee can submit leave with dates and leave type.
+      - Invalid date ranges are rejected.
+  - id: HRMS-REQ-004
+    title: Manager leave approval
+    acceptance:
+      - Manager can approve or reject leave for direct reports only.
+      - Approval status is visible to the requesting employee.
+  - id: HRMS-REQ-005
+    title: Role-based access control
+    acceptance:
+      - HR, Manager, and Employee permissions are enforced server-side.
+      - Unauthorized operations return a non-success response without data leakage.

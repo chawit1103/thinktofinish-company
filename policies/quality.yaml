@@ -1,0 +1,16 @@
+acceptance_criteria_required: true
+tests_required: true
+independent_review_required: true
+security_review_required: true
+traceability_required: true
+
+release_evidence_required:
+  - project
+  - release
+  - target_environment
+  - ci
+  - tests
+  - review
+  - security
+  - traceability_complete
+  - residual_risks

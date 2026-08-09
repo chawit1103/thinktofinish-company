@@ -1,0 +1,23 @@
+project: example-project
+release: v0.1.0
+target_environment: staging
+ci:
+  status: pass
+  checks:
+    - unit-tests
+    - lint
+    - typecheck
+tests:
+  status: pass
+  total: 0
+review:
+  status: approved
+  reviewer: qa-reviewer
+security:
+  status: pass
+  critical_findings: 0
+  high_findings: 0
+traceability_complete: true
+residual_risks: []
+approvals:
+  production_deployment: false

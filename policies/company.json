@@ -1,0 +1,22 @@
+{
+  "company": {
+    "name": "ThinkToFinish AI Software Company",
+    "owner_role": "Owner / Chairman"
+  },
+  "principles": [
+    "Agent = Capability",
+    "Loop = Reliability",
+    "Graph = Organization",
+    "Governance = Company",
+    "Portable First, Native Only When Necessary",
+    "Technical decisions may be autonomous within policy; business and high-risk decisions escalate to humans"
+  ],
+  "operating_model": {
+    "project_isolation": "one_board_per_project",
+    "engineering_workspace": "worktree",
+    "direct_push_to_main": false,
+    "pull_request_required": true,
+    "independent_review_required": true,
+    "production_human_gate": true
+  }
+}

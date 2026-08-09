@@ -1,0 +1,33 @@
+{
+  "max_critical_findings": 0,
+  "max_high_findings": 0,
+  "protected_actions": [
+    "production_deployment",
+    "destructive_database_migration",
+    "credential_change",
+    "production_database_write",
+    "security_exception"
+  ],
+  "forbidden_actions": [
+    "direct_push_main",
+    "bypass_required_review",
+    "disable_security_controls",
+    "expose_credentials"
+  ],
+  "role_boundaries": {
+    "orchestrator": {
+      "production_credentials": false,
+      "writes_production_code": false
+    },
+    "engineer": {
+      "production_credentials": false,
+      "direct_push_main": false
+    },
+    "qa-reviewer": {
+      "merge_without_ci": false
+    },
+    "release-manager": {
+      "production_credentials": "limited"
+    }
+  }
+}

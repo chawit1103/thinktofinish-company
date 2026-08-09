@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "company": {
+      "type": "stdio",
+      "command": "./scripts/run-mcp.sh",
+      "args": [],
+      "env": {
+        "TTF_COMPANY_DATA": "${PLUGIN_DATA}"
+      }
+    }
+  }
+}

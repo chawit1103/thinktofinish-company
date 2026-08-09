@@ -1,0 +1,28 @@
+id: PROJECT-FEATURE-001
+title: Implement a concrete delivery task
+goal: Describe the user-facing or system outcome in one sentence.
+inputs:
+  - Product requirement or parent handoff
+outputs:
+  - Production code or deliverable
+  - Tests or verification artifact
+acceptance_criteria:
+  - Concrete behavior that must be true
+verification:
+  - pytest tests/path -q
+risk: medium
+assignee_role: engineer
+constraints:
+  - Preserve existing public contracts unless the requirement explicitly changes them
+boundaries:
+  - src/
+  - tests/
+review:
+  required: true
+  profile: qa-reviewer
+security:
+  required: true
+  profile: qa-reviewer
+traceability:
+  requirement_ids:
+    - REQ-001

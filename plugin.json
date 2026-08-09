@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "thinktofinish-company",
+  "version": "0.1.0",
+  "description": "Company governance, contracts, traceability, release evidence, and metrics for Hermes Agent software delivery.",
+  "author": {
+    "name": "ThinkToFinish"
+  },
+  "license": "MIT",
+  "keywords": ["hermes", "software-company", "governance", "agent", "kanban", "quality-gates"]
+}
