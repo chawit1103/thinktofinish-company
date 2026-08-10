@@ -168,6 +168,25 @@ if [[ ${#LEGACY_IDS[@]} -gt 0 && "$REPLACE_LEGACY" -ne 1 ]]; then
   exit 1
 fi
 
+JOB_INFO="$(cron_jobs "$JOB_NAME")"
+CURRENT_WAS_ACTIVE=0
+JOB_ID=""
+JOB_STATE=""
+ORIGINAL_ACTIVE_JOB_IDS=()
+if [[ -n "$JOB_INFO" ]]; then
+  CANONICAL_JOB="$(printf '%s\n' "$JOB_INFO" | awk '
+    NR == 1 { fallback=$0 }
+    $2 == "active" { print; found=1; exit }
+    END { if (!found) print fallback }
+  ')"
+  JOB_ID="${CANONICAL_JOB%% *}"
+  JOB_STATE="${CANONICAL_JOB#* }"
+  [[ "$JOB_STATE" != "active" ]] || CURRENT_WAS_ACTIVE=1
+  while read -r CURRENT_ID CURRENT_STATE; do
+    [[ "$CURRENT_STATE" != "active" ]] || ORIGINAL_ACTIVE_JOB_IDS+=("$CURRENT_ID")
+  done <<< "$JOB_INFO"
+fi
+
 mkdir -p "$TARGET"
 TARGET="$(canonical_path "$TARGET")"
 if [[ "$TARGET" != "$PROFILE_HOME/"* ]]; then
@@ -177,6 +196,71 @@ fi
 ENGINE_PATH="$TARGET/$ENGINE"
 ENGINE_CORE_PATH="$TARGET/$ENGINE_CORE"
 ROLLBACK_DIR="$(mktemp -d "$TARGET/.ttf-${BOARD}-engine-rollback.XXXXXX")"
+ENGINE_FILES_COMMITTED=0
+finish_engine_files() {
+  local status=$?
+  local rollback_failed=0
+  trap - EXIT HUP INT TERM
+  set +e
+  if [[ "$ENGINE_FILES_COMMITTED" -ne 1 ]]; then
+    [[ -z "$JOB_ID" ]] || "${HERMES_CMD[@]}" cron pause "$JOB_ID" >/dev/null 2>&1 || rollback_failed=1
+    if (( ${#ORIGINAL_ACTIVE_JOB_IDS[@]} )); then
+      for CURRENT_ID in "${ORIGINAL_ACTIVE_JOB_IDS[@]}"; do
+        "${HERMES_CMD[@]}" cron pause "$CURRENT_ID" >/dev/null 2>&1 || rollback_failed=1
+      done
+    fi
+  fi
+  if ! python3 - "$ENGINE_PATH" "$ENGINE_CORE_PATH" "$ROLLBACK_DIR" "$ENGINE_FILES_COMMITTED" <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+wrapper, core, rollback = map(Path, sys.argv[1:4])
+committed = sys.argv[4] == "1"
+if rollback.exists():
+    if not committed and (rollback / "ready").exists():
+        for path, name in ((core, "core"), (wrapper, "wrapper")):
+            backup = rollback / name
+            if (rollback / f"{name}.existed").exists():
+                os.replace(backup, path)
+            else:
+                path.unlink(missing_ok=True)
+    shutil.rmtree(rollback, ignore_errors=committed)
+PY
+  then
+    echo "Failed to restore the previous transition engine files." >&2
+    rollback_failed=1
+  fi
+  if [[ "$ENGINE_FILES_COMMITTED" -ne 1 ]]; then
+    if (( ${#LEGACY_IDS[@]} )); then
+      for ((i=0; i<${#LEGACY_IDS[@]}; i++)); do
+        hermes -p "${LEGACY_PROFILES[$i]}" cron resume "${LEGACY_IDS[$i]}" >/dev/null 2>&1 || rollback_failed=1
+      done
+    fi
+    if (( ${#ORIGINAL_ACTIVE_JOB_IDS[@]} )); then
+      for CURRENT_ID in "${ORIGINAL_ACTIVE_JOB_IDS[@]}"; do
+        "${HERMES_CMD[@]}" cron resume "$CURRENT_ID" >/dev/null 2>&1 || rollback_failed=1
+      done
+    fi
+  fi
+  [[ "$rollback_failed" -eq 0 ]] || status=1
+  exit "$status"
+}
+trap finish_engine_files EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if (( ${#ORIGINAL_ACTIVE_JOB_IDS[@]} )); then
+  for CURRENT_ID in "${ORIGINAL_ACTIVE_JOB_IDS[@]}"; do
+    if ! "${HERMES_CMD[@]}" cron pause "$CURRENT_ID"; then
+      echo "Could not pause the active transition job before staging its engine." >&2
+      exit 1
+    fi
+  done
+fi
+
 if ! python3 - "$ENGINE_PATH" "$ENGINE_CORE_PATH" "$ROOT/scripts/kanban-transition-engine.py" \
   "$BOARD" "$KANBAN_HOME" "$PINNED_DB" "$PROFILE" "$ROLLBACK_DIR" <<'PY'
 import os
@@ -209,6 +293,7 @@ try:
         if existed[name]:
             shutil.copy2(path, rollback / name, follow_symlinks=False)
             (rollback / f"{name}.existed").touch()
+    (rollback / "ready").touch()
     wrapper_source = (
         "#!/usr/bin/env python3\nimport os, subprocess, sys\n"
         "for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_CLAIM_LOCK', 'HERMES_KANBAN_WORKSPACE'):\n    os.environ.pop(key, None)\n"
@@ -219,7 +304,7 @@ try:
     published = True
     atomic_write(core, source.read_bytes())
     atomic_write(wrapper, wrapper_source.encode())
-except Exception:
+except BaseException:
     if published:
         for path, name in targets:
             backup = rollback / name
@@ -234,52 +319,10 @@ then
   echo "Could not stage the board-specific transition engine; previous files were preserved." >&2
   exit 1
 fi
-
-ENGINE_FILES_COMMITTED=0
-finish_engine_files() {
-  local status=$?
-  set +e
-  if ! python3 - "$ENGINE_PATH" "$ENGINE_CORE_PATH" "$ROLLBACK_DIR" "$ENGINE_FILES_COMMITTED" <<'PY'
-import os
-import shutil
-import sys
-from pathlib import Path
-
-wrapper, core, rollback = map(Path, sys.argv[1:4])
-committed = sys.argv[4] == "1"
-if not committed:
-    for path, name in ((core, "core"), (wrapper, "wrapper")):
-        backup = rollback / name
-        if (rollback / f"{name}.existed").exists():
-            os.replace(backup, path)
-        else:
-            path.unlink(missing_ok=True)
-shutil.rmtree(rollback, ignore_errors=committed)
-PY
-  then
-    echo "Failed to restore the previous transition engine files." >&2
-    status=1
-  fi
-  trap - EXIT
-  exit "$status"
-}
-trap finish_engine_files EXIT
-
-JOB_INFO="$(cron_jobs "$JOB_NAME")"
-CURRENT_WAS_ACTIVE=0
-JOB_ID=""
 if [[ -n "$JOB_INFO" ]]; then
-  CANONICAL_JOB="$(printf '%s\n' "$JOB_INFO" | awk '
-    NR == 1 { fallback=$0 }
-    $2 == "active" { print; found=1; exit }
-    END { if (!found) print fallback }
-  ')"
-  JOB_ID="${CANONICAL_JOB%% *}"
-  JOB_STATE="${CANONICAL_JOB#* }"
-  [[ "$JOB_STATE" != "active" ]] || CURRENT_WAS_ACTIVE=1
   "${HERMES_CMD[@]}" cron edit "$JOB_ID" --schedule 'every 1m' --script "$ENGINE" \
     --no-agent --repeat 0 --monitor-script '' --monitor-url ''
-  if [[ "$JOB_STATE" != "active" ]]; then
+  if [[ "$JOB_STATE" != "active" || "$CURRENT_WAS_ACTIVE" -eq 1 ]]; then
     "${HERMES_CMD[@]}" cron resume "$JOB_ID"
   fi
 else

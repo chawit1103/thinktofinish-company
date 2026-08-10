@@ -1143,6 +1143,56 @@ exit 0
     assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
 
 
+def test_installer_restores_active_engine_when_interrupted(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    scripts.mkdir(parents=True)
+    old_wrapper = scripts / "ttf-demo-transition-engine.py"
+    old_core = scripts / "ttf-demo-transition-engine-core.py"
+    old_wrapper.write_text("signal old wrapper\n", encoding="utf-8")
+    old_core.write_text("signal old core\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+case "$*" in
+  "-p orchestrator cron edit "*) kill -TERM "$PPID"; sleep 0.1; exit 143 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode == 143
+    assert "cron pause bbb222" in commands and "cron resume bbb222" in commands
+    assert old_wrapper.read_text(encoding="utf-8") == "signal old wrapper\n"
+    assert old_core.read_text(encoding="utf-8") == "signal old core\n"
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+
+
 def test_installer_rolls_back_replacement_when_activation_cannot_be_verified(tmp_path):
     home, _, _ = make_board(tmp_path)
     fake_bin = tmp_path / "bin"
@@ -1320,7 +1370,7 @@ exit 0
     assert result.returncode != 0
     assert "cron pause aaa111" in commands and "cron pause aaa222" in commands
     assert "cron resume aaa111" in commands and "cron resume aaa222" in commands
-    assert "cron pause bbb222" not in commands
+    assert "cron pause bbb222" in commands and "cron resume bbb222" in commands
     assert old_wrapper.read_text(encoding="utf-8") == "late old wrapper\n"
     assert old_core.read_text(encoding="utf-8") == "late old core\n"
     assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
