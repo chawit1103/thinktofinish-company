@@ -2071,6 +2071,138 @@ exit 0
     assert list((home / "plugins").glob(".thinktofinish-company.*")) == []
 
 
+@pytest.mark.parametrize("home_name", [".hermes", "[runtime]", "q?mark", "star*path", "back\\slash"])
+def test_local_install_excludes_hermes_home_nested_in_source(tmp_path, home_name):
+    source = tmp_path / "source"
+    scripts = source / "scripts"
+    scripts.mkdir(parents=True)
+    installer = scripts / "install-local.sh"
+    installer.write_bytes((ROOT / "scripts" / "install-local.sh").read_bytes())
+    installer.chmod(0o755)
+    for required in ("plugin.json", "mcp.json", "server.py"):
+        (source / required).write_bytes((ROOT / required).read_bytes())
+
+    home = source / home_name
+    home.mkdir()
+    (home / "auth.json").write_text('{"token":"must-not-copy"}\n', encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+
+    for _ in range(2):
+        result = subprocess.run(
+            [str(installer), "--profile", "default"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+
+    target = home / "plugins" / "thinktofinish-company"
+    assert (target / "plugin.json").is_file()
+    assert not (target / home_name).exists()
+    assert list((home / "plugins").glob(".thinktofinish-company.*")) == []
+
+    if home_name == ".hermes":
+        same_root = subprocess.run(
+            [str(installer), "--profile", "default"],
+            text=True,
+            capture_output=True,
+            env={**env, "HERMES_HOME": str(source)},
+        )
+        assert same_root.returncode == 2
+        assert "must not be the plugin source directory" in same_root.stderr
+
+
+def test_local_install_does_not_restore_an_unowned_pid_backup(tmp_path):
+    home = tmp_path / "home"
+    target = home / "plugins" / "thinktofinish-company"
+    target.mkdir(parents=True)
+    (target / "sentinel").write_text("current", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+case "$*" in "-p default plugins enable thinktofinish-company --no-allow-tool-override") exit 1 ;; esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    result = subprocess.run(
+        [
+            "/bin/bash", "-c",
+            'stale="$HERMES_HOME/plugins/.thinktofinish-company.backup.$$"; '
+            'mkdir -p "$stale"; printf stale > "$stale/sentinel"; '
+            'exec "$INSTALL_SCRIPT" --profile default',
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "INSTALL_SCRIPT": str(ROOT / "scripts" / "install-local.sh"),
+        },
+    )
+
+    assert result.returncode != 0
+    assert (target / "sentinel").read_text(encoding="utf-8") == "current"
+    stale = list((home / "plugins").glob(".thinktofinish-company.backup.*"))
+    assert len(stale) == 1
+    assert (stale[0] / "sentinel").read_text(encoding="utf-8") == "stale"
+
+
+def test_local_install_retains_owned_backup_when_target_removal_fails(tmp_path):
+    home = tmp_path / "home"
+    target = home / "plugins" / "thinktofinish-company"
+    target.mkdir(parents=True)
+    (target / "sentinel").write_text("old", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+case "$*" in "-p default plugins enable thinktofinish-company --no-allow-tool-override") exit 1 ;; esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    fake_rm = fake_bin / "rm"
+    fake_rm.write_text(
+        """#!/bin/sh
+if [ "$*" = "-rf $HERMES_TEST_TARGET" ]; then exit 1; fi
+exec /bin/rm "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o755)
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_TARGET": str(target),
+        },
+    )
+
+    assert result.returncode != 0
+    assert (target / "plugin.json").is_file()
+    assert not (target / "previous").exists()
+    backups = list((home / "plugins").glob(".thinktofinish-company.backup.*"))
+    assert len(backups) == 1
+    assert (backups[0] / "previous" / "sentinel").read_text(encoding="utf-8") == "old"
+
+
 def test_local_install_distinguishes_shared_and_profile_homes(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

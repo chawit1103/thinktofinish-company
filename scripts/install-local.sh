@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROFILE="default"
-SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +39,10 @@ canonical_path() {
   python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
 }
 
+escape_tar_pattern() {
+  python3 -c 'import sys; print("".join("\\" + c if c in "\\*?[]" else c for c in sys.argv[1]))' "$1"
+}
+
 ACTIVE_HOME="$(strip_trailing_slashes "${HERMES_HOME:-$HOME/.hermes}")"
 require_safe_root "$ACTIVE_HOME" HERMES_HOME
 ACTIVE_PARENT="${ACTIVE_HOME%/*}"
@@ -73,6 +77,10 @@ if [[ "$HROOT" != "$SHARED_HOME" && "$HROOT" != "$SHARED_HOME/"* ]]; then
   echo "Profile home resolves outside shared Hermes home: $HROOT" >&2
   exit 2
 fi
+if [[ "$SHARED_HOME" == "$SOURCE" || "$HROOT" == "$SOURCE" ]]; then
+  echo "Hermes runtime home must not be the plugin source directory: $SOURCE" >&2
+  exit 2
+fi
 HERMES_CMD=(hermes -p "$PROFILE")
 
 PLUGIN_PARENT="$HROOT/plugins"
@@ -90,6 +98,7 @@ if [[ "$RESOLVED_TARGET" != "$PLUGIN_PARENT/"* ]]; then
 fi
 STAGE="$(mktemp -d "$PLUGIN_PARENT/.thinktofinish-company.XXXXXX")"
 BACKUP=""
+BACKUP_DIR=""
 INSTALLED=0
 rollback() {
   local status=$?
@@ -100,9 +109,18 @@ rollback() {
     [[ -z "$STAGE" || ! -e "$STAGE" ]] || rm -rf "$STAGE"
     if [[ -n "$BACKUP" && ( -e "$BACKUP" || -L "$BACKUP" ) ]]; then
       [[ ! -e "$TARGET" && ! -L "$TARGET" ]] || rm -rf "$TARGET" || rollback_failed=1
-      mv "$BACKUP" "$TARGET" || rollback_failed=1
+      if [[ -e "$TARGET" || -L "$TARGET" ]]; then
+        rollback_failed=1
+      elif mv "$BACKUP" "$TARGET"; then
+        rmdir "$BACKUP_DIR" || rollback_failed=1
+      else
+        rollback_failed=1
+      fi
     elif [[ "$INSTALLED" -eq 1 && ( -e "$TARGET" || -L "$TARGET" ) ]]; then
       rm -rf "$TARGET" || rollback_failed=1
+    fi
+    if [[ -n "$BACKUP_DIR" && ( -e "$BACKUP_DIR" || -L "$BACKUP_DIR" ) && ! -e "$BACKUP" && ! -L "$BACKUP" ]]; then
+      rmdir "$BACKUP_DIR" || rollback_failed=1
     fi
   fi
   [[ "$rollback_failed" -eq 0 ]] || status=1
@@ -113,19 +131,25 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Copy the portable package without local build/cache state.
-tar -C "$SOURCE" \
-  --exclude='.git' --exclude='.venv' --exclude='.pytest_cache' \
-  --exclude='__pycache__' --exclude='.local-data' \
-  --exclude='.env' --exclude='.env.*' \
-  -cf - . | tar -C "$STAGE" -xf -
+# Copy the portable package without local build/cache or an embedded Hermes runtime.
+COPY_EXCLUDES=(
+  --exclude='.git' --exclude='.venv' --exclude='.pytest_cache'
+  --exclude='__pycache__' --exclude='.local-data'
+  --exclude='.env' --exclude='.env.*'
+)
+if [[ "$SHARED_HOME" == "$SOURCE/"* ]]; then
+  COPY_EXCLUDES+=(--exclude="$(escape_tar_pattern "${SHARED_HOME#"$SOURCE/"}")")
+elif [[ "$PLUGIN_PARENT" == "$SOURCE/"* ]]; then
+  COPY_EXCLUDES+=(--exclude="$(escape_tar_pattern "${PLUGIN_PARENT#"$SOURCE/"}")")
+fi
+tar -C "$SOURCE" "${COPY_EXCLUDES[@]}" -cf - . | tar -C "$STAGE" -xf -
 
 for REQUIRED in plugin.json mcp.json server.py; do
   [[ -f "$STAGE/$REQUIRED" ]] || { echo "Staged plugin is missing $REQUIRED" >&2; exit 1; }
 done
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then
-  BACKUP="$PLUGIN_PARENT/.thinktofinish-company.backup.$$"
-  [[ ! -e "$BACKUP" ]] || { echo "Backup path already exists: $BACKUP" >&2; exit 1; }
+  BACKUP_DIR="$(mktemp -d "$PLUGIN_PARENT/.thinktofinish-company.backup.XXXXXX")"
+  BACKUP="$BACKUP_DIR/previous"
   mv "$TARGET" "$BACKUP"
 fi
 INSTALLED=1
@@ -135,9 +159,10 @@ STAGE=""
 chmod +x "$TARGET/scripts/"*.sh 2>/dev/null || true
 "${HERMES_CMD[@]}" plugins enable thinktofinish-company --no-allow-tool-override >/dev/null
 trap - EXIT HUP INT TERM
-if [[ -n "$BACKUP" ]]; then
-  rm -rf "$BACKUP"
+if [[ -n "$BACKUP_DIR" ]]; then
+  rm -rf "$BACKUP_DIR"
   BACKUP=""
+  BACKUP_DIR=""
 fi
 
 echo "Installed and enabled thinktofinish-company for profile: $PROFILE"
