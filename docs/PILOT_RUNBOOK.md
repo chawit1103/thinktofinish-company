@@ -44,7 +44,7 @@ After Architecture completes, the second orchestrator reads upstream handoffs an
 
 - 2–4 scoped implementation producer cards (`engineer`) where parallelism is safe, each with a pre-created read-only reviewer child (`qa-reviewer`)
 - Integration producer, parented on approved implementation reviews, with its own pre-created reviewer child
-- Independent QA/Security card (`qa-reviewer`), parent=Integration
+- Independent QA/Security card (`qa-reviewer`), parent=approved Integration reviewer child
 - Release Evidence card (`release-manager`), parent=QA/Security
 - Company Closeout card (`orchestrator`), parent=Release Evidence
 

@@ -12,11 +12,24 @@ import subprocess
 from pathlib import Path
 
 COMMIT = re.compile(r"\bcommit\s+[0-9a-f]{7,64}\b", re.IGNORECASE)
-VERIFICATION = re.compile(r"\b(?:pass(?:ed)?|success(?:ful(?:ly)?)?|succeeded|verified)\b", re.IGNORECASE)
+VERIFICATION = re.compile(r"\b(?:pytest|tests?|checks?|validation|verification)\b.{0,48}\b(?:pass(?:ed)?|succeed(?:ed)?|verified)\b", re.IGNORECASE)
+FAILED_VERIFICATION = re.compile(
+    r"\b(?:[1-9]\d*\s+(?:failed|failures?|errors?)|(?:pytest|tests?|checks?|validation|verification)\b.{0,32}\b(?:failed|failure|errors?|not\s+pass(?:ed)?))\b",
+    re.IGNORECASE,
+)
+ZERO_FAILURES = re.compile(r"\b0\s+(?:failed|failures?|errors?)\b", re.IGNORECASE)
 
 
 def eligible(summary: str | None, reviewer_count: int) -> bool:
-    return bool(summary and summary.lstrip().lower().startswith("review-required:") and COMMIT.search(summary) and VERIFICATION.search(summary) and reviewer_count)
+    verification = ZERO_FAILURES.sub("", summary or "")
+    return bool(
+        summary
+        and summary.lstrip().lower().startswith("review-required:")
+        and COMMIT.search(summary)
+        and VERIFICATION.search(summary)
+        and not FAILED_VERIFICATION.search(verification)
+        and reviewer_count
+    )
 
 
 def main() -> int:
@@ -31,6 +44,9 @@ def main() -> int:
         assert not eligible("review-required: pytest passed", 1)
         assert not eligible("review-required: commit abcdef1; pytest ran", 1)
         assert not eligible("review-required: abcdef1; pytest passed", 1)
+        assert not eligible("review-required: commit abcdef1; pytest: 2 passed, 1 failed", 1)
+        assert not eligible("review-required: commit abcdef1; tests not passed", 1)
+        assert eligible("review-required: commit abcdef1; 71 tests + 47 subtests pass; 0 failed", 1)
         assert not eligible("review-required: commit abcdef1", 0)
         print("self-test passed")
         return 0

@@ -39,6 +39,7 @@ Treat Hermes as the execution OS and this skill as company governance.
 - Downstream cards must receive structured handoff evidence, not "done" prose.
 - A producer cannot be the only judge of its own output.
 - Pre-create a read-only reviewer child for every code producer. A `review-required:` handoff completes the producer and promotes that child; never mark review waiting as `blocked`.
+- QA/security and release gates depend on the approved integration reviewer child, never the integration producer directly.
 - A reviewer `REQUEST_CHANGES` creates one remediation producer and its reviewer child automatically. Preserve failed cards as evidence; do not require an operator to repair ordinary graph transitions.
 - Reserve `blocked` for a retained human gate, a real safety boundary, or an unavailable required capability after safe alternatives. Dependency waits and routine tool approval timeouts are not human-input blocks.
 - Do not expose secrets in Kanban metadata or traceability metadata.

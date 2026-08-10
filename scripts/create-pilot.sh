@@ -73,7 +73,7 @@ Required orchestration pattern:
 3. Create a second orchestrator card assigned to `orchestrator`, parented on the Architecture card, goal_mode=true, titled roughly "Plan and dispatch Mini HRMS engineering DAG". Its body must instruct that future orchestrator to read Product + Architecture handoffs and then create the concrete engineering graph, including:
    - 2-4 parallelizable implementation cards assigned to `engineer` where architecture permits, each with a pre-created read-only `qa-reviewer` child;
    - an integration card gated on approved implementation reviews, with its own pre-created read-only `qa-reviewer` child;
-   - independent QA/security card assigned to `qa-reviewer` gated on integration;
+   - independent QA/security card assigned to `qa-reviewer` gated on the approved integration-review child, never on the integration producer directly;
    - release-evidence card assigned to `release-manager` gated on QA/security;
    - final company closeout card assigned to `orchestrator` gated on release evidence.
    Every implementation card must include a Company Task Contract (goal, inputs, outputs, acceptance criteria, verification, risk, assignee, review/security, requirement IDs). Engineering producer cards must use goal_mode=false and state that `review-required:` is the handoff completion, not a block.
