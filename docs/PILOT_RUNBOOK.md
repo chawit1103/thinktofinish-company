@@ -17,6 +17,7 @@ Prepare a Git repo with at least one commit. Confirm the Hermes model/provider w
 
 ```bash
 ./scripts/create-pilot.sh /absolute/path/to/mini-hrms mini-hrms
+./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
 hermes gateway start
 hermes dashboard
 ```
@@ -41,13 +42,15 @@ The kickoff then completes.
 
 After Architecture completes, the second orchestrator reads upstream handoffs and should create:
 
-- 2–4 scoped implementation cards (`engineer`) where parallelism is safe
-- Integration card, parented on all implementation cards
+- 2–4 scoped implementation producer cards (`engineer`) where parallelism is safe, each with a pre-created read-only reviewer child (`qa-reviewer`)
+- Integration producer, parented on approved implementation reviews, with its own pre-created reviewer child
 - Independent QA/Security card (`qa-reviewer`), parent=Integration
 - Release Evidence card (`release-manager`), parent=QA/Security
 - Company Closeout card (`orchestrator`), parent=Release Evidence
 
-Implementation cards should be goal-mode and include explicit Company Task Contracts.
+Implementation producers use normal Kanban cards, not goal-mode: their terminal outcome is a verified `review-required:` commit handoff. Goal-mode is reserved for an orchestration/research card whose completion does not depend on a downstream child.
+
+The board-scoped autopilot advances verified producer handoffs, creates remediation/review pairs after ordinary review failures, and preserves prior failures as archived evidence. It does not approve reviews or bypass human gates.
 
 ### Phase C — release closeout
 

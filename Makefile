@@ -16,5 +16,5 @@ pilot:
 
 autopilot-check:
 	$(PYTHON) scripts/kanban-handoff-autopilot.py --self-test
-	python3 -m py_compile scripts/kanban-state-snapshot.py
+	$(PYTHON) -m py_compile scripts/kanban-state-snapshot.py
 	bash -n scripts/enable-kanban-autopilot.sh

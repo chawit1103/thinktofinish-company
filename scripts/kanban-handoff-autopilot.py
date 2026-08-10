@@ -11,11 +11,12 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-COMMIT = re.compile(r"\b[0-9a-f]{7,64}\b", re.IGNORECASE)
+COMMIT = re.compile(r"\bcommit\s+[0-9a-f]{7,64}\b", re.IGNORECASE)
+VERIFICATION = re.compile(r"\b(?:pass(?:ed)?|success(?:ful(?:ly)?)?|succeeded|verified)\b", re.IGNORECASE)
 
 
 def eligible(summary: str | None, reviewer_count: int) -> bool:
-    return bool(summary and summary.lstrip().lower().startswith("review-required:") and COMMIT.search(summary) and reviewer_count)
+    return bool(summary and summary.lstrip().lower().startswith("review-required:") and COMMIT.search(summary) and VERIFICATION.search(summary) and reviewer_count)
 
 
 def main() -> int:
@@ -28,6 +29,8 @@ def main() -> int:
     if args.self_test:
         assert eligible("review-required: commit abcdef1; pytest passed", 1)
         assert not eligible("review-required: pytest passed", 1)
+        assert not eligible("review-required: commit abcdef1; pytest ran", 1)
+        assert not eligible("review-required: abcdef1; pytest passed", 1)
         assert not eligible("review-required: commit abcdef1", 0)
         print("self-test passed")
         return 0
