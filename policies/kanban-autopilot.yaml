@@ -11,11 +11,13 @@ retained_blocked_allowed_only_for:
 never_block_for:
   - dependency_waiting
   - independent_review_waiting
+  - review_required_handoff
   - ordinary_technical_decision
   - routine_tool_approval_timeout
 actions:
   dependency_waiting: autonomous
   independent_review_waiting: autonomous
+  review_required_handoff: autonomous
   review_request_changes: autonomous
   ordinary_technical_decision: autonomous
   routine_tool_approval_timeout: autonomous

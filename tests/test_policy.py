@@ -26,3 +26,9 @@ def test_forbidden_action():
 def test_review_request_changes_is_autonomous():
     result = check_policy("review_request_changes", "low")
     assert result["decision"] == "autonomous"
+
+
+def test_review_required_handoff_is_autonomous():
+    result = check_policy("review_required_handoff", "low")
+    assert result["decision"] == "autonomous"
+    assert result["requires_human"] is False
