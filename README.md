@@ -235,15 +235,15 @@ Research → Product Spec → Architecture
                       └→ Data ────┘
 ```
 
-### Autonomous Kanban recovery
+### Deterministic Kanban transitions
 
-Enable the board-scoped autopilot after creating a pilot:
+Enable the board-scoped transition engine after creating a pilot:
 
 ```bash
 ./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
 ```
 
-It installs two cron jobs for that board only: a no-agent handoff reconciler and a low-cost governor that wakes only when the Kanban state changes. They advance verified producer handoffs, create remediation/review pairs after ordinary review failures, and preserve failed work as archived evidence. They never approve a review, bypass a human gate, deploy, push `main`, or handle real credentials/PII.
+It installs one no-agent cron for that board only. Reviewers write a structured `ttf_review` verdict; on `changes_requested`, the engine creates a remediation/re-review pair, rewires downstream dependencies to the replacement review, and archives the rejected review as evidence. It never approves a review, bypasses a human gate, deploys, pushes `main`, or handles real credentials/PII.
 
 ---
 

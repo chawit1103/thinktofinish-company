@@ -24,7 +24,8 @@ Use after implementation/integration and before a release candidate is declared 
 
 ## Outcomes
 - `release_candidate_ready`: evidence satisfies company policy.
-- `blocked`: return precise failed gates and route repair work to the correct owner.
+- `changes_requested`: write a structured `ttf_review` JSON comment with reviewed commit and actionable findings, then block the review card. The transition engine creates the remediation/re-review pair and rewires downstream gates.
+- `blocked`: reserve for policy or capability stops, not ordinary review changes.
 - Production remains a separate human-gated action even when a release candidate is ready.
 
 ## Pitfalls

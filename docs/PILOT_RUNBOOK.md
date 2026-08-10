@@ -50,7 +50,7 @@ After Architecture completes, the second orchestrator reads upstream handoffs an
 
 Implementation producers use normal Kanban cards, not goal-mode: their terminal outcome is a verified `review-required:` commit handoff. Goal-mode is reserved for an orchestration/research card whose completion does not depend on a downstream child.
 
-The board-scoped autopilot advances verified producer handoffs, creates remediation/review pairs after ordinary review failures, and preserves prior failures as archived evidence. It does not approve reviews or bypass human gates.
+The board-scoped transition engine reads structured reviewer verdicts. A `changes_requested` verdict creates a remediation/re-review pair, rewires downstream dependencies to the new review, and archives the rejected review as evidence. It does not approve reviews or bypass human gates.
 
 ### Phase C — release closeout
 

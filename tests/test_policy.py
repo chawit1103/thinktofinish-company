@@ -23,6 +23,6 @@ def test_forbidden_action():
     assert result["allowed"] is False
 
 
-def test_kanban_handoff_is_autonomous():
-    result = check_policy("review_required_handoff", "low")
+def test_review_request_changes_is_autonomous():
+    result = check_policy("review_request_changes", "low")
     assert result["decision"] == "autonomous"
