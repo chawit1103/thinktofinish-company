@@ -349,9 +349,23 @@ fi
 if [[ -n "$JOB_INFO" ]]; then
   "${HERMES_CMD[@]}" cron edit "$JOB_ID" --schedule 'every 1m' --script "$ENGINE" \
     --no-agent --repeat 0 --monitor-script '' --monitor-url ''
-  if [[ "$JOB_STATE" != "active" || "$CURRENT_WAS_ACTIVE" -eq 1 ]]; then
-    "${HERMES_CMD[@]}" cron resume "$JOB_ID"
+fi
+
+# Stop every legacy graph owner before the replacement activation boundary.
+PAUSED_LEGACY_INDEXES=()
+for ((i=0; i<${#LEGACY_IDS[@]}; i++)); do
+  if hermes -p "${LEGACY_PROFILES[$i]}" cron pause "${LEGACY_IDS[$i]}"; then
+    PAUSED_LEGACY_INDEXES+=("$i")
+    echo "Paused legacy job: ${LEGACY_PROFILES[$i]}:${LEGACY_NAMES[$i]}"
+    continue
   fi
+  echo "Failed to pause legacy job; restoring the previous active-job state." >&2
+  hermes -p "${LEGACY_PROFILES[$i]}" cron resume "${LEGACY_IDS[$i]}" >/dev/null 2>&1 || true
+  exit 1
+done
+
+if [[ -n "$JOB_INFO" ]]; then
+  "${HERMES_CMD[@]}" cron resume "$JOB_ID"
 else
   CREATE_OUTPUT="$(NO_COLOR=1 "${HERMES_CMD[@]}" cron create --name "$JOB_NAME" --script "$ENGINE" --no-agent --repeat 0 'every 1m')"
   printf '%s\n' "$CREATE_OUTPUT"
@@ -379,7 +393,6 @@ CURRENT_EXTRA_IDS=()
 while read -r EXTRA_ID EXTRA_STATE; do
   [[ "$EXTRA_STATE" != "active" || "$EXTRA_ID" == "$CURRENT_KEEP_ID" ]] || CURRENT_EXTRA_IDS+=("$EXTRA_ID")
 done <<< "$ACTIVE_CURRENT"
-PAUSED_LEGACY_INDEXES=()
 restore_previous_jobs() {
   if (( ${#PAUSED_LEGACY_INDEXES[@]} )); then
     for PAUSED_INDEX in "${PAUSED_LEGACY_INDEXES[@]}"; do
@@ -404,19 +417,6 @@ if (( ${#CURRENT_EXTRA_IDS[@]} )); then
     fi
   done
 fi
-
-# The replacement is active; now remove every other graph owner without risking an automation outage.
-for ((i=0; i<${#LEGACY_IDS[@]}; i++)); do
-  if hermes -p "${LEGACY_PROFILES[$i]}" cron pause "${LEGACY_IDS[$i]}"; then
-    PAUSED_LEGACY_INDEXES+=("$i")
-    echo "Paused legacy job: ${LEGACY_PROFILES[$i]}:${LEGACY_NAMES[$i]}"
-    continue
-  fi
-  echo "Failed to pause legacy job; restoring the previous active-job state." >&2
-  hermes -p "${LEGACY_PROFILES[$i]}" cron resume "${LEGACY_IDS[$i]}" >/dev/null 2>&1 || true
-  restore_previous_jobs
-  exit 1
-done
 
 ENGINE_FILES_COMMITTED=1
 echo "Transition engine enabled for board: $BOARD (profile: $PROFILE)"

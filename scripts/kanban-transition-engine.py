@@ -22,6 +22,12 @@ GIT_COMMIT = re.compile(r"[0-9a-fA-F]{7,64}")
 MAX_REMEDIATION_GENERATIONS = 3
 ENGINE_AUTHOR = "ttf-transition-engine"
 LOCK_BUSY = "transition engine already running"
+ENGINE_KEY_PREFIXES = (
+    "ttf-remediation-",
+    "ttf-rereview-",
+    "ttf-review-gate-",
+    "ttf-refresh-review-",
+)
 GIT_ROUTING_ENV = {
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CEILING_DIRECTORIES",
@@ -40,6 +46,13 @@ class ReviewVerdict:
     decision: str
     reviewed_commit: str
     findings: tuple[str, ...]
+
+
+@dataclass(frozen=True, order=True)
+class TerminalFrontier:
+    parent_id: str
+    child_id: str
+    path: tuple[str, ...]
 
 
 def parse_review_verdict(comment: str) -> ReviewVerdict | None:
@@ -153,6 +166,25 @@ def stale_review_gate_body(review_id: str, verdict: ReviewVerdict) -> str:
         f"Automatic review refresh stopped after {MAX_REMEDIATION_GENERATIONS} stale generations for `{review_id}`. "
         f"The latest verdict still referenced `{verdict.reviewed_commit}`.\n\n"
         "Owner input is required to stabilize the checkout or reviewer before downstream work can continue."
+    )
+
+
+def terminal_replay_body(
+    review_id: str,
+    frontiers: tuple[tuple[str, TerminalFrontier], ...],
+) -> str:
+    paths = "\n".join(
+        f"- approval `{approval_id}`: "
+        + " -> ".join(f"`{task_id}`" for task_id in (*frontier.path, frontier.child_id))
+        for approval_id, frontier in frontiers
+    )
+    return (
+        f"Owner replay decision required after review transition `{review_id}`. Completed ordinary work below an "
+        "invalidated approval may contain output from the pre-transition baseline and cannot be replayed safely by the "
+        f"transition engine.\n\nAffected terminal paths and live frontiers:\n{paths}\n\n"
+        "Keep this gate blocked until the completed ordinary tasks have been replayed or explicitly revalidated against "
+        "the successor commit, their new evidence has been recorded, and every gated live task is safe to resume. Do not "
+        "treat the prior completed output as current evidence."
     )
 
 
@@ -293,17 +325,108 @@ def task_descendants(conn: sqlite3.Connection, task_id: str) -> set[str]:
     }
 
 
+def terminal_descendant_frontiers(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[TerminalFrontier, ...]:
+    frontiers: set[TerminalFrontier] = set()
+    expanded: set[tuple[str, bool]] = set()
+    stack: list[tuple[str, tuple[str, ...], bool]] = [(task_id, (), False)]
+    while stack:
+        parent_id, path, has_ordinary = stack.pop()
+        state = (parent_id, has_ordinary)
+        if state in expanded:
+            continue
+        expanded.add(state)
+        children = conn.execute(
+            "SELECT c.* FROM task_links l JOIN tasks c ON c.id=l.child_id "
+            "WHERE l.parent_id=? ORDER BY c.id",
+            (parent_id,),
+        ).fetchall()
+        for child in reversed(children):
+            child_id = child["id"]
+            if child["status"] in {"done", "archived"}:
+                stack.append(
+                    (
+                        child_id,
+                        (*path, child_id),
+                        has_ordinary or historical_verdict(conn, child_id) is None,
+                    )
+                )
+            elif path:
+                frontiers.add(TerminalFrontier(parent_id, child_id, path))
+    return tuple(sorted(frontiers))
+
+
+def scan_approval_side_paths(
+    conn: sqlite3.Connection,
+    approval_id: str,
+    excluded_path: set[str],
+    excluded_reviews: set[str],
+) -> tuple[
+    tuple[str, ...],
+    tuple[TerminalFrontier, ...],
+]:
+    direct_children: set[str] = set()
+    frontiers: set[TerminalFrontier] = set()
+    expanded: set[str] = set()
+    stack: list[tuple[str, tuple[str, ...]]] = [(approval_id, ())]
+    while stack:
+        parent_id, ordinary_path = stack.pop()
+        if parent_id in expanded:
+            continue
+        expanded.add(parent_id)
+        children = conn.execute(
+            "SELECT c.* FROM task_links l JOIN tasks c ON c.id=l.child_id "
+            "WHERE l.parent_id=? ORDER BY c.id",
+            (parent_id,),
+        ).fetchall()
+        for child in reversed(children):
+            child_id = child["id"]
+            if child_id in excluded_path or (child["idempotency_key"] or "").startswith(
+                ENGINE_KEY_PREFIXES
+            ):
+                continue
+            terminal = child["status"] in {"done", "archived"}
+            if not terminal:
+                if ordinary_path:
+                    frontiers.add(
+                        TerminalFrontier(
+                            parent_id=parent_id,
+                            child_id=child_id,
+                            path=ordinary_path,
+                        )
+                    )
+                else:
+                    direct_children.add(child_id)
+                continue
+            child_verdict = historical_verdict(conn, child_id)
+            if child_verdict:
+                if ordinary_path and child_id not in excluded_reviews:
+                    stack.append((child_id, (*ordinary_path, child_id)))
+                continue
+            stack.append((child_id, (*ordinary_path, child_id)))
+    return (
+        tuple(sorted(direct_children)),
+        tuple(sorted(frontiers)),
+    )
+
+
 def approval_side_edges(
     conn: sqlite3.Connection,
     review: sqlite3.Row,
     producer: sqlite3.Row,
-) -> tuple[tuple[sqlite3.Row, ReviewVerdict, tuple[str, ...]], ...]:
+) -> tuple[
+    tuple[sqlite3.Row, ReviewVerdict, tuple[str, ...], tuple[TerminalFrontier, ...]],
+    ...,
+]:
     ancestors = task_ancestors(conn, review["id"])
     review_descendants = task_descendants(conn, review["id"])
-    excluded = review_descendants | {review["id"]}
+    if ancestors & review_descendants:
+        raise ValueError(f"review ancestry cycle detected at {review['id']}")
+    excluded_reviews = {review["id"]}
     candidates: dict[str, tuple[sqlite3.Row, ReviewVerdict]] = {}
     for ancestor_id in sorted(ancestors):
-        if ancestor_id == producer["id"] or ancestor_id in excluded:
+        if ancestor_id == producer["id"] or ancestor_id in excluded_reviews:
             continue
         ancestor = conn.execute("SELECT * FROM tasks WHERE id=?", (ancestor_id,)).fetchone()
         if not ancestor or ancestor["status"] not in {"done", "archived"}:
@@ -323,42 +446,39 @@ def approval_side_edges(
             (parent_id,),
         ).fetchall()
         for child in children:
-            if child["id"] in excluded or child["status"] not in {"done", "archived"}:
+            if child["id"] in excluded_reviews or child["status"] not in {"done", "archived"}:
                 continue
             child_verdict = historical_verdict(conn, child["id"])
             if not child_verdict:
                 continue
             candidates[child["id"]] = (child, child_verdict)
             frontier.append(child["id"])
+    scans: dict[str, tuple[tuple[str, ...], tuple[TerminalFrontier, ...]]] = {}
+    for candidate_id in sorted(candidates):
+        direct_children, terminal_frontiers = scan_approval_side_paths(
+            conn,
+            candidate_id,
+            ancestors | {review["id"]},
+            excluded_reviews,
+        )
+        scans[candidate_id] = (direct_children, terminal_frontiers)
     approvals = []
     for sibling, verdict in (candidates[task_id] for task_id in sorted(candidates)):
-        side_children = tuple(
-            row["id"]
-            for row in conn.execute(
-                "SELECT c.id, c.idempotency_key FROM task_links l JOIN tasks c ON c.id=l.child_id "
-                "WHERE l.parent_id=? AND c.status NOT IN ('done', 'archived') ORDER BY c.id",
-                (sibling["id"],),
-            )
-            if row["id"] != review["id"]
-            and row["id"] not in ancestors
-            and not (row["idempotency_key"] or "").startswith(
-                ("ttf-remediation-", "ttf-rereview-", "ttf-review-gate-", "ttf-refresh-review-")
-            )
-        )
+        side_children, terminal_frontiers = scans[sibling["id"]]
         if verdict.decision != "approved":
-            if sibling["status"] == "archived" and not side_children:
+            if sibling["status"] == "archived" and not side_children and not terminal_frontiers:
                 continue
             raise ValueError(
                 f"terminal sibling review {sibling['id']} gating live work has a non-approved verdict"
             )
-        if not side_children:
+        if not side_children and not terminal_frontiers:
             continue
         if not isinstance(sibling["assignee"], str) or not sibling["assignee"].strip():
             raise ValueError(f"terminal sibling review {sibling['id']} has no assignee")
         if sibling["tenant"] and (review["tenant"] or producer["tenant"]):
             if sibling["tenant"] != (review["tenant"] or producer["tenant"]):
                 raise ValueError(f"tenant mismatch between {sibling['id']} and {review['id']}")
-        approvals.append((sibling, verdict, side_children))
+        approvals.append((sibling, verdict, side_children, terminal_frontiers))
     return tuple(approvals)
 
 
@@ -626,9 +746,21 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
     if active:
         raise ValueError(f"review {review_id} already has an active or conflicting transition")
     approval_edges = approval_side_edges(conn, review, producer)
+    descendant_frontiers = terminal_descendant_frontiers(conn, review_id)
+    downstream_rows = conn.execute(
+        "SELECT c.id, c.status FROM task_links l JOIN tasks c ON c.id=l.child_id "
+        "WHERE l.parent_id=? AND c.status!='archived' ORDER BY c.id",
+        (review_id,),
+    ).fetchall()
+    downstream = tuple(row["id"] for row in downstream_rows)
     regated_children = {
-        child_id for _sibling, _verdict, children in approval_edges for child_id in children
-    }
+        child_id
+        for _sibling, _verdict, children, terminal_frontiers in approval_edges
+        for child_id in (
+            *children,
+            *(frontier.child_id for frontier in terminal_frontiers),
+        )
+    } | {frontier.child_id for frontier in descendant_frontiers} | set(downstream)
     producer_workspace = workspace(producer).removeprefix("dir:")
     candidates = conn.execute(
         "WITH candidates AS (SELECT t.*, EXISTS ("
@@ -642,7 +774,8 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
         "FROM tasks t WHERE t.id!=?) "
         "SELECT id, status, current_run_id, claim_lock, worker_pid, workspace_kind, workspace_path, "
         "same_producer, engine_transition FROM candidates WHERE "
-        "(current_run_id IS NOT NULL OR status IN ('running', 'review') "
+        "(current_run_id IS NOT NULL OR claim_lock IS NOT NULL OR worker_pid IS NOT NULL "
+        "OR status IN ('running', 'review') "
         "OR (status IN ('todo', 'ready') AND parents_terminal))",
         (producer["id"], review_id),
     ).fetchall()
@@ -670,32 +803,31 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
     reviewed_head = resolve_reviewed_commit(producer["id"], producer_root, verdict.reviewed_commit)
     digest = transition_digest(producer, review, verdict, head)
     depth, refresh_depth = transition_depths(conn, review_id)
-    downstream_rows = conn.execute(
-        "SELECT c.id, c.status FROM task_links l JOIN tasks c ON c.id=l.child_id "
-        "WHERE l.parent_id=? AND c.status!='archived' ORDER BY c.id",
-        (review_id,),
-    ).fetchall()
-    downstream = tuple(row["id"] for row in downstream_rows)
     peer_approvals = tuple(
         (
             sibling,
             sibling_verdict,
             side_children,
+            terminal_frontiers,
             resolve_reviewed_commit(
                 producer["id"], producer_root, sibling_verdict.reviewed_commit
             ),
         )
-        for sibling, sibling_verdict, side_children in approval_edges
+        for sibling, sibling_verdict, side_children, terminal_frontiers in approval_edges
     )
     actual_approvals = (
-        tuple(approval for approval in peer_approvals if approval[3] != head)
+        tuple(approval for approval in peer_approvals if approval[4] != head)
         if reviewed_head != head or depth >= MAX_REMEDIATION_GENERATIONS
         else peer_approvals
     )
     actual_regated_children = {
-        child_id for _sibling, _verdict, children, _reviewed_head in actual_approvals
-        for child_id in children
-    }
+        child_id
+        for _sibling, _verdict, children, terminal_frontiers, _reviewed_head in actual_approvals
+        for child_id in (
+            *children,
+            *(frontier.child_id for frontier in terminal_frontiers),
+        )
+    } | {frontier.child_id for frontier in descendant_frontiers} | set(downstream)
     if tentatively_skipped_children - actual_regated_children:
         return None
     return (
@@ -710,6 +842,7 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
         refresh_depth,
         reviewed_head,
         peer_approvals,
+        descendant_frontiers,
     )
 
 
@@ -834,6 +967,75 @@ def rewire_children(
         inherit_notify_subs(conn, child, (successor_id,), now)
 
 
+def terminal_frontiers_for(approvals) -> tuple[tuple[str, TerminalFrontier], ...]:
+    return tuple(
+        sorted(
+            (sibling["id"], frontier)
+            for sibling, _verdict, _children, frontiers, _reviewed_head in approvals
+            for frontier in frontiers
+        )
+    )
+
+
+def merge_terminal_frontiers(*groups) -> tuple[tuple[str, TerminalFrontier], ...]:
+    merged: dict[tuple[str, str, str], tuple[str, TerminalFrontier]] = {}
+    for group in groups:
+        for approval_id, frontier in group:
+            merged[(approval_id, frontier.parent_id, frontier.child_id)] = (approval_id, frontier)
+    return tuple(sorted(merged.values()))
+
+
+def terminal_gate_parents(
+    conn: sqlite3.Connection,
+    review_id: str,
+    frontiers: tuple[tuple[str, TerminalFrontier], ...],
+) -> tuple[str, ...]:
+    review_descendants = task_descendants(conn, review_id)
+    return tuple(
+        sorted(
+            {
+                frontier.parent_id
+                for _approval_id, frontier in frontiers
+                if frontier.parent_id not in review_descendants
+            }
+        )
+    )
+
+
+def gate_terminal_frontiers(
+    conn: sqlite3.Connection,
+    gate_id: str,
+    frontiers: tuple[tuple[str, TerminalFrontier], ...],
+) -> None:
+    now = int(time.time())
+    for child_id in sorted({frontier.child_id for _approval_id, frontier in frontiers}):
+        child = conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?",
+            (child_id,),
+        ).fetchone()
+        if not child or child["status"] in {"done", "archived"}:
+            raise RuntimeError(f"terminal side-path frontier {child_id} changed during atomic transition")
+        if (
+            child["current_run_id"] is not None
+            or child["claim_lock"] is not None
+            or child["worker_pid"] is not None
+            or child["status"] in {"running", "review"}
+        ):
+            raise RuntimeError(f"terminal side-path frontier {child_id} became active")
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO task_links(parent_id, child_id) VALUES (?, ?)",
+            (gate_id, child_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='todo' WHERE id=? AND status='ready' "
+            "AND current_run_id IS NULL AND claim_lock IS NULL AND worker_pid IS NULL",
+            (child_id,),
+        )
+        if inserted.rowcount:
+            append_event(conn, child_id, "linked", {"parent": gate_id, "child": child_id}, now)
+            inherit_notify_subs(conn, child_id, (gate_id,), now)
+
+
 def rewire_and_archive(
     conn: sqlite3.Connection,
     review_id: str,
@@ -873,32 +1075,66 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
             refresh_depth,
             reviewed_head,
             peer_approvals,
+            descendant_frontiers,
         ) = plan
         tenant = review["tenant"] or producer["tenant"]
         workspace_path = workspace(producer).removeprefix("dir:")
         stale_peer_approvals = tuple(
-            approval for approval in peer_approvals if approval[3] != head
+            approval for approval in peer_approvals if approval[4] != head
         )
+        classified_descendants: dict[tuple[str, str], tuple[bool, TerminalFrontier]] = {}
+        for frontier in descendant_frontiers:
+            review_only = all(historical_verdict(conn, task_id) for task_id in frontier.path)
+            key = (frontier.parent_id, frontier.child_id)
+            if key not in classified_descendants or not review_only:
+                classified_descendants[key] = (review_only, frontier)
+        descendant_review_frontiers = [
+            (review_id, frontier)
+            for review_only, frontier in classified_descendants.values()
+            if review_only
+        ]
+        descendant_replay_frontiers = [
+            (review_id, frontier)
+            for review_only, frontier in classified_descendants.values()
+            if not review_only
+        ]
         if reviewed_head != head:
             if refresh_depth >= MAX_REMEDIATION_GENERATIONS:
+                replay_frontiers = merge_terminal_frontiers(
+                    descendant_replay_frontiers,
+                    terminal_frontiers_for(stale_peer_approvals),
+                )
+                replay_parents = terminal_gate_parents(conn, review_id, replay_frontiers)
+                body = stale_review_gate_body(review_id, verdict)
+                if replay_frontiers:
+                    body += "\n\n" + terminal_replay_body(review_id, replay_frontiers)
                 gate = insert_task(
                     conn,
                     title=f"Owner input required for repeated stale reviews from {review_id}",
-                    body=stale_review_gate_body(review_id, verdict),
+                    body=body,
                     assignee=owner_profile,
                     status="blocked",
                     workspace_path=workspace_path,
                     tenant=tenant,
                     idempotency_key=f"ttf-review-gate-{review_id}-{digest}",
-                    parents=(producer["id"],),
+                    parents=(producer["id"], *replay_parents),
                     block_kind="needs_input",
                     notification_parents=(
                         review_id,
                         *(approval[0]["id"] for approval in stale_peer_approvals),
+                        *(frontier.child_id for _approval_id, frontier in replay_frontiers),
                     ),
                 )
-                for sibling, _sibling_verdict, side_children, _sibling_head in stale_peer_approvals:
+                for (
+                    sibling,
+                    _sibling_verdict,
+                    side_children,
+                    _terminal_frontiers,
+                    _sibling_head,
+                ) in stale_peer_approvals:
                     rewire_children(conn, sibling["id"], gate, side_children)
+                gate_terminal_frontiers(conn, gate, replay_frontiers)
+                gate_terminal_frontiers(conn, gate, descendant_review_frontiers)
                 rewire_and_archive(conn, review_id, gate, downstream, digest)
                 conn.commit()
                 return f"gated stale review {review_id} -> {gate} after {refresh_depth} refreshes"
@@ -913,7 +1149,14 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
                 idempotency_key=f"ttf-refresh-review-{review_id}-{digest}",
                 parents=(review_id,),
             )
-            for sibling, sibling_verdict, side_children, _sibling_head in stale_peer_approvals:
+            peer_refreshes: dict[str, str] = {}
+            for (
+                sibling,
+                sibling_verdict,
+                side_children,
+                _terminal_frontiers,
+                _sibling_head,
+            ) in stale_peer_approvals:
                 peer_refresh = insert_task(
                     conn,
                     title=f"Refresh stale prior approval from {sibling['id']}",
@@ -930,29 +1173,80 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
                     parents=(review_id,),
                     notification_parents=(sibling["id"],),
                 )
+                peer_refreshes[sibling["id"]] = peer_refresh
                 rewire_children(conn, sibling["id"], peer_refresh, side_children)
+            gate_terminal_frontiers(conn, refresh, descendant_review_frontiers)
+            replay_frontiers = merge_terminal_frontiers(
+                descendant_replay_frontiers,
+                terminal_frontiers_for(stale_peer_approvals),
+            )
+            if replay_frontiers:
+                affected_approvals = {approval_id for approval_id, _frontier in replay_frontiers}
+                replay_gate = insert_task(
+                    conn,
+                    title=f"Owner replay required for stale side paths from {review_id}",
+                    body=terminal_replay_body(review_id, replay_frontiers),
+                    assignee=owner_profile,
+                    status="blocked",
+                    workspace_path=workspace_path,
+                    tenant=tenant,
+                    idempotency_key=f"ttf-review-gate-{review_id}-replay-{digest}",
+                    parents=(
+                        refresh,
+                        *(
+                            peer_refreshes[approval_id]
+                            for approval_id in sorted(affected_approvals)
+                            if approval_id in peer_refreshes
+                        ),
+                        *sorted({frontier.parent_id for _approval_id, frontier in replay_frontiers}),
+                    ),
+                    block_kind="needs_input",
+                    notification_parents=(
+                        review_id,
+                        *sorted(affected_approvals),
+                        *(frontier.child_id for _approval_id, frontier in replay_frontiers),
+                    ),
+                )
+                gate_terminal_frontiers(conn, replay_gate, replay_frontiers)
             rewire_and_archive(conn, review_id, refresh, downstream, digest)
             conn.commit()
             return f"refreshed stale review {review_id} -> {refresh} at {head}"
         if depth >= MAX_REMEDIATION_GENERATIONS:
+            replay_frontiers = merge_terminal_frontiers(
+                descendant_replay_frontiers,
+                terminal_frontiers_for(stale_peer_approvals),
+            )
+            replay_parents = terminal_gate_parents(conn, review_id, replay_frontiers)
+            body = gate_body(review_id, verdict)
+            if replay_frontiers:
+                body += "\n\n" + terminal_replay_body(review_id, replay_frontiers)
             gate = insert_task(
                 conn,
                 title=f"Owner input required for repeated review failures from {review_id}",
-                body=gate_body(review_id, verdict),
+                body=body,
                 assignee=owner_profile,
                 status="blocked",
                 workspace_path=workspace_path,
                 tenant=tenant,
                 idempotency_key=f"ttf-review-gate-{review_id}-{digest}",
-                parents=(producer["id"],),
+                parents=(producer["id"], *replay_parents),
                 block_kind="needs_input",
                 notification_parents=(
                     review_id,
                     *(approval[0]["id"] for approval in stale_peer_approvals),
+                    *(frontier.child_id for _approval_id, frontier in replay_frontiers),
                 ),
             )
-            for sibling, _sibling_verdict, side_children, _sibling_head in stale_peer_approvals:
+            for (
+                sibling,
+                _sibling_verdict,
+                side_children,
+                _terminal_frontiers,
+                _sibling_head,
+            ) in stale_peer_approvals:
                 rewire_children(conn, sibling["id"], gate, side_children)
+            gate_terminal_frontiers(conn, gate, replay_frontiers)
+            gate_terminal_frontiers(conn, gate, descendant_review_frontiers)
             rewire_and_archive(conn, review_id, gate, downstream, digest)
             conn.commit()
             return f"gated {review_id} -> {gate} after {depth} remediation generations"
@@ -979,7 +1273,14 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
             idempotency_key=f"ttf-rereview-{review_id}-{digest}",
             parents=(remediation,),
         )
-        for sibling, sibling_verdict, side_children, _sibling_head in peer_approvals:
+        peer_reviews: dict[str, str] = {}
+        for (
+            sibling,
+            sibling_verdict,
+            side_children,
+            _terminal_frontiers,
+            _sibling_head,
+        ) in peer_approvals:
             peer_review = insert_task(
                 conn,
                 title=f"Refresh prior approval from {sibling['id']} after {remediation}",
@@ -996,7 +1297,41 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
                 parents=(remediation,),
                 notification_parents=(sibling["id"],),
             )
+            peer_reviews[sibling["id"]] = peer_review
             rewire_children(conn, sibling["id"], peer_review, side_children)
+        gate_terminal_frontiers(conn, follow_up, descendant_review_frontiers)
+        replay_frontiers = merge_terminal_frontiers(
+            descendant_replay_frontiers,
+            terminal_frontiers_for(peer_approvals),
+        )
+        if replay_frontiers:
+            affected_approvals = {approval_id for approval_id, _frontier in replay_frontiers}
+            replay_gate = insert_task(
+                conn,
+                title=f"Owner replay required for completed side paths from {review_id}",
+                body=terminal_replay_body(review_id, replay_frontiers),
+                assignee=owner_profile,
+                status="blocked",
+                workspace_path=workspace_path,
+                tenant=tenant,
+                idempotency_key=f"ttf-review-gate-{review_id}-replay-{digest}",
+                parents=(
+                    follow_up,
+                    *(
+                        peer_reviews[approval_id]
+                        for approval_id in sorted(affected_approvals)
+                        if approval_id in peer_reviews
+                    ),
+                    *sorted({frontier.parent_id for _approval_id, frontier in replay_frontiers}),
+                ),
+                block_kind="needs_input",
+                notification_parents=(
+                    review_id,
+                    *sorted(affected_approvals),
+                    *(frontier.child_id for _approval_id, frontier in replay_frontiers),
+                ),
+            )
+            gate_terminal_frontiers(conn, replay_gate, replay_frontiers)
         rewire_and_archive(conn, review_id, follow_up, downstream, digest)
         conn.commit()
         return f"remediated {review_id} -> {remediation} -> {follow_up}"
