@@ -97,6 +97,7 @@ fi
 HERMES_CMD=(hermes -p "$PROFILE")
 TARGET="$PROFILE_HOME/scripts"
 ENGINE="ttf-${BOARD}-transition-engine.py"
+ENGINE_CORE="ttf-${BOARD}-transition-engine-core.py"
 JOB_NAME="ttf-${BOARD}-transition-engine"
 
 # Read-only preflight: fail before changing profile files or cron state.
@@ -168,23 +169,42 @@ if [[ ${#LEGACY_IDS[@]} -gt 0 && "$REPLACE_LEGACY" -ne 1 ]]; then
 fi
 
 mkdir -p "$TARGET"
-cp "$ROOT/scripts/kanban-transition-engine.py" "$TARGET/kanban-transition-engine.py"
-python3 - "$TARGET/$ENGINE" "$TARGET/kanban-transition-engine.py" "$BOARD" "$KANBAN_HOME" "$PINNED_DB" "$PROFILE" <<'PY'
+TARGET="$(canonical_path "$TARGET")"
+if [[ "$TARGET" != "$PROFILE_HOME/"* ]]; then
+  echo "Profile scripts directory resolves outside profile home: $TARGET" >&2
+  exit 2
+fi
+python3 - "$TARGET/$ENGINE" "$TARGET/$ENGINE_CORE" "$ROOT/scripts/kanban-transition-engine.py" \
+  "$BOARD" "$KANBAN_HOME" "$PINNED_DB" "$PROFILE" <<'PY'
 import os
 import sys
+import tempfile
 from pathlib import Path
 
-wrapper, source = map(Path, sys.argv[1:3])
-board, kanban_home, kanban_db, owner_profile = sys.argv[3:7]
-wrapper.write_text(
+wrapper, core, source = map(Path, sys.argv[1:4])
+board, kanban_home, kanban_db, owner_profile = sys.argv[4:8]
+
+def atomic_write(path: Path, data: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+atomic_write(core, source.read_bytes())
+wrapper_source = (
     "#!/usr/bin/env python3\nimport os, subprocess, sys\n"
     "for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_CLAIM_LOCK', 'HERMES_KANBAN_WORKSPACE'):\n    os.environ.pop(key, None)\n"
     f"os.environ['HERMES_KANBAN_HOME'] = {kanban_home!r}\n"
     f"os.environ['HERMES_KANBAN_DB'] = {kanban_db!r}\n"
-    f"raise SystemExit(subprocess.run([sys.executable, {str(source)!r}, '--board', {board!r}, '--home', {kanban_home!r}, '--owner-profile', {owner_profile!r}]).returncode)\n",
-    encoding="utf-8",
+    f"raise SystemExit(subprocess.run([sys.executable, {str(core)!r}, '--board', {board!r}, '--home', {kanban_home!r}, '--owner-profile', {owner_profile!r}]).returncode)\n"
 )
-wrapper.chmod(0o755)
+atomic_write(wrapper, wrapper_source.encode())
 PY
 
 JOB_INFO="$(cron_jobs "$JOB_NAME")"

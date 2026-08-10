@@ -22,6 +22,17 @@ GIT_COMMIT = re.compile(r"[0-9a-fA-F]{7,64}")
 MAX_REMEDIATION_GENERATIONS = 3
 ENGINE_AUTHOR = "ttf-transition-engine"
 LOCK_BUSY = "transition engine already running"
+GIT_ROUTING_ENV = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+}
 
 
 @dataclass(frozen=True)
@@ -62,14 +73,22 @@ def findings_text(verdict: ReviewVerdict) -> str:
     return "\n".join(f"- {item}" for item in verdict.findings)
 
 
-def remediation_body(review_id: str, producer_id: str, verdict: ReviewVerdict) -> str:
+def remediation_body(
+    review_id: str,
+    producer_id: str,
+    verdict: ReviewVerdict,
+    expected_head: str | None = None,
+) -> str:
+    expected_head = expected_head or verdict.reviewed_commit
     return (
         f"Remediate the independent review `{review_id}` for commit `{verdict.reviewed_commit}`.\n\n"
         f"Required findings:\n{findings_text(verdict)}\n\n"
         f"Original producer task: `{producer_id}`. Read its full task contract, acceptance criteria, requirement IDs, "
         "completion evidence, and verification commands before editing. Revalidate the complete original contract, not only "
         "the listed findings.\n\n"
-        "Work only in the declared workspace. Add deterministic regression coverage, run the task's verification commands, "
+        f"Before editing, verify the checkout is clean and `HEAD` is `{expected_head}`; block instead of editing if either "
+        "condition changed. Work only in the declared workspace. Add deterministic regression coverage, run the task's "
+        "verification commands, "
         "commit a clean handoff, and complete this producer with structured evidence. Do not push main, deploy, use real data, "
         "or bypass the follow-up independent review."
     )
@@ -93,6 +112,30 @@ def gate_body(review_id: str, verdict: ReviewVerdict) -> str:
         f"commit `{verdict.reviewed_commit}`.\n\nOutstanding findings:\n{findings_text(verdict)}\n\n"
         "Owner input is required before any further remediation. This card now gates every downstream task; complete it "
         "only after recording the owner's decision and safe next action."
+    )
+
+
+def stale_review_body(
+    review_id: str,
+    producer_id: str,
+    verdict: ReviewVerdict,
+    current_head: str,
+) -> str:
+    return (
+        f"Refresh independent review `{review_id}` because its verdict covered stale commit "
+        f"`{verdict.reviewed_commit}` while the clean checkout is now `{current_head}`.\n\n"
+        f"Prior findings to re-evaluate:\n{findings_text(verdict)}\n\n"
+        f"Read the full contract and evidence for producer `{producer_id}`. Review the current checkout without editing it, "
+        "rerun the required verification, and return one structured ttf_review verdict whose reviewed_commit is the current "
+        "HEAD. Do not copy the stale verdict without rechecking the implementation."
+    )
+
+
+def stale_review_gate_body(review_id: str, verdict: ReviewVerdict) -> str:
+    return (
+        f"Automatic review refresh stopped after {MAX_REMEDIATION_GENERATIONS} stale generations for `{review_id}`. "
+        f"The latest verdict still referenced `{verdict.reviewed_commit}`.\n\n"
+        "Owner input is required to stabilize the checkout or reviewer before downstream work can continue."
     )
 
 
@@ -203,32 +246,107 @@ def historical_rejection(conn: sqlite3.Connection, review_id: str) -> bool:
     )
 
 
+def git_output(task_id: str, path: Path, *args: str, input_text: str | None = None) -> str:
+    env = os.environ.copy()
+    for key in GIT_ROUTING_ENV:
+        env.pop(key, None)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            capture_output=True,
+            timeout=15,
+            env=env,
+            input=input_text,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"producer {task_id} workspace is not a usable Git checkout") from exc
+    return result.stdout
+
+
+def checkout_root(task_id: str, path: str) -> Path:
+    expanded = Path(path).expanduser()
+    if not expanded.is_absolute():
+        raise ValueError(f"producer {task_id} workspace is unavailable: {path}")
+    resolved = expanded.resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"producer {task_id} workspace is unavailable: {path}")
+    root = Path(git_output(task_id, resolved, "rev-parse", "--show-toplevel").strip()).resolve()
+    return root
+
+
 def workspace(task: sqlite3.Row) -> str:
     kind = task["workspace_kind"]
     path = task["workspace_path"]
     if kind not in {"dir", "worktree"} or not path:
         raise ValueError(f"producer {task['id']} has no persistent workspace")
-    resolved = Path(path).expanduser()
-    if not resolved.is_absolute() or not resolved.is_dir():
-        raise ValueError(f"producer {task['id']} workspace is unavailable: {path}")
-    return f"dir:{resolved}"
+    declared = Path(path).expanduser()
+    root = checkout_root(task["id"], path)
+    if root != declared.resolve():
+        raise ValueError(f"producer {task['id']} workspace must be the Git checkout root: {root}")
+    return f"dir:{root}"
+
+
+def require_clean_checkout(task_id: str, path: Path, seen: set[Path] | None = None) -> None:
+    seen = seen or set()
+    path = path.resolve()
+    if path in seen:
+        raise ValueError(f"producer {task_id} workspace has a recursive submodule")
+    seen.add(path)
+    flags = git_output(task_id, path, "ls-files", "-v", "-z")
+    if any(entry[:1] == "S" or entry[:1].islower() for entry in flags.split("\0") if entry):
+        raise ValueError(f"producer {task_id} workspace uses hidden Git index flags")
+    status = git_output(
+        task_id, path, "status", "--porcelain=v1", "--untracked-files=normal", "--ignore-submodules=none"
+    )
+    if status:
+        raise ValueError(f"producer {task_id} workspace is dirty; commit or clean every tracked/untracked change")
+    for entry in git_output(task_id, path, "ls-files", "--stage", "-z").split("\0"):
+        metadata, separator, relative = entry.partition("\t")
+        if not separator or not metadata.startswith("160000 "):
+            continue
+        submodule = (path / relative).resolve()
+        if not submodule.is_relative_to(path):
+            raise ValueError(f"producer {task_id} workspace has an unsafe submodule path")
+        if (submodule / ".git").exists():
+            require_clean_checkout(task_id, submodule, seen)
 
 
 def workspace_head(task: sqlite3.Row) -> str:
-    path = workspace(task).removeprefix("dir:")
-    try:
-        result = subprocess.run(
-            ["git", "-C", path, "rev-parse", "HEAD"],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ValueError(f"producer {task['id']} workspace has no Git commit") from exc
-    head = result.stdout.strip()
-    if not GIT_COMMIT.fullmatch(head):
+    path = Path(workspace(task).removeprefix("dir:"))
+    require_clean_checkout(task["id"], path)
+    head = git_output(task["id"], path, "rev-parse", "HEAD").strip()
+    require_clean_checkout(task["id"], path)
+    confirmed_head = git_output(task["id"], path, "rev-parse", "HEAD").strip()
+    if head != confirmed_head:
+        raise ValueError(f"producer {task['id']} workspace changed during verification")
+    if not GIT_COMMIT.fullmatch(confirmed_head):
         raise ValueError(f"producer {task['id']} has no valid Git HEAD")
-    return head
+    return confirmed_head
+
+
+def resolve_reviewed_commit(task_id: str, path: Path, commit: str) -> str | None:
+    try:
+        objects = [
+            value
+            for value in git_output(task_id, path, "rev-parse", f"--disambiguate={commit.lower()}").splitlines()
+            if GIT_COMMIT.fullmatch(value)
+        ]
+        if len(objects) != 1:
+            return None
+        resolved = objects[0]
+        object_type = git_output(
+            task_id,
+            path,
+            "cat-file",
+            "--batch-check=%(objecttype)",
+            input_text=f"{resolved}\n",
+        ).strip()
+    except ValueError:
+        return None
+    return resolved if object_type == "commit" else None
 
 
 def remediation_producer(conn: sqlite3.Connection, review: sqlite3.Row) -> sqlite3.Row:
@@ -260,39 +378,55 @@ def remediation_producer(conn: sqlite3.Connection, review: sqlite3.Row) -> sqlit
         return parent
 
 
-def remediation_depth(conn: sqlite3.Connection, task_id: str) -> int:
-    current = task_id
-    seen = {current}
-    depth = 0
+def transition_depths(conn: sqlite3.Connection, task_id: str) -> tuple[int, int]:
+    current = conn.execute("SELECT id, idempotency_key FROM tasks WHERE id=?", (task_id,)).fetchone()
+    seen: set[str] = set()
+    remediation_depth = 0
+    refresh_depth = 0
     while True:
+        if not current:
+            return remediation_depth, refresh_depth
+        if current["id"] in seen:
+            raise ValueError(f"review ancestry cycle detected at {current['id']}")
+        seen.add(current["id"])
+        key = current["idempotency_key"] or ""
+        remediation_depth += key.startswith("ttf-remediation-")
+        refresh_depth += key.startswith("ttf-refresh-review-")
         parents = conn.execute(
             "SELECT p.id, p.idempotency_key FROM task_links l JOIN tasks p ON p.id=l.parent_id WHERE l.child_id=?",
-            (current,),
+            (current["id"],),
         ).fetchall()
-        remediations = [row for row in parents if (row["idempotency_key"] or "").startswith("ttf-remediation-")]
-        if not remediations:
-            return depth
-        if len(remediations) != 1:
-            raise ValueError(f"review {task_id} has ambiguous remediation ancestry")
-        remediation = remediations[0]
-        if remediation["id"] in seen:
-            raise ValueError(f"review ancestry cycle detected at {remediation['id']}")
-        seen.add(remediation["id"])
-        depth += 1
-        rejected = [
-            row[0]
-            for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (remediation["id"],))
-            if historical_rejection(conn, row[0])
-        ]
-        if len(rejected) != 1:
-            raise ValueError(f"remediation {remediation['id']} has no unique rejected review parent")
-        current = rejected[0]
-        if current in seen:
-            raise ValueError(f"review ancestry cycle detected at {current}")
-        seen.add(current)
+        if key.startswith("ttf-remediation-"):
+            lineage = [row for row in parents if historical_rejection(conn, row["id"])]
+            if len(lineage) != 1:
+                raise ValueError(f"remediation {current['id']} has no unique rejected review parent")
+        else:
+            lineage = [
+                row for row in parents if (row["idempotency_key"] or "").startswith("ttf-remediation-")
+            ]
+            if not lineage:
+                lineage = [row for row in parents if historical_verdict(conn, row["id"])]
+            if len(lineage) > 1:
+                raise ValueError(f"review {task_id} has ambiguous transition ancestry")
+            if not lineage:
+                return remediation_depth, refresh_depth
+        current = lineage[0]
 
 
-def transition_digest(producer: sqlite3.Row, review: sqlite3.Row, verdict: ReviewVerdict) -> str:
+def remediation_depth(conn: sqlite3.Connection, task_id: str) -> int:
+    return transition_depths(conn, task_id)[0]
+
+
+def stale_refresh_depth(conn: sqlite3.Connection, task_id: str) -> int:
+    return transition_depths(conn, task_id)[1]
+
+
+def transition_digest(
+    producer: sqlite3.Row,
+    review: sqlite3.Row,
+    verdict: ReviewVerdict,
+    workspace_head: str,
+) -> str:
     payload = json.dumps(
         {
             "producer": producer["id"],
@@ -301,6 +435,7 @@ def transition_digest(producer: sqlite3.Row, review: sqlite3.Row, verdict: Revie
             "review_assignee": review["assignee"],
             "tenant": review["tenant"] or producer["tenant"],
             "workspace": workspace(producer),
+            "workspace_head": workspace_head,
             "verdict": {
                 "decision": verdict.decision,
                 "reviewed_commit": verdict.reviewed_commit,
@@ -311,6 +446,23 @@ def transition_digest(producer: sqlite3.Row, review: sqlite3.Row, verdict: Revie
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+def candidate_shares_checkout(candidate: sqlite3.Row, producer_root: Path) -> bool:
+    raw_path = candidate["workspace_path"]
+    if not isinstance(raw_path, str) or not raw_path or not Path(raw_path).expanduser().is_absolute():
+        raise ValueError(f"active transition {candidate['id']} has an unverifiable workspace")
+    candidate_path = Path(raw_path).expanduser().resolve()
+    if (
+        candidate_path == producer_root
+        or candidate_path.is_relative_to(producer_root)
+        or producer_root.is_relative_to(candidate_path)
+    ):
+        return True
+    try:
+        return checkout_root(candidate["id"], raw_path) == producer_root
+    except ValueError as exc:
+        raise ValueError(f"active transition {candidate['id']} has an unverifiable workspace") from exc
 
 
 def transition_plan(conn: sqlite3.Connection, review_id: str):
@@ -330,27 +482,44 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
     producer = remediation_producer(conn, review)
     if producer["tenant"] and review["tenant"] and producer["tenant"] != review["tenant"]:
         raise ValueError(f"tenant mismatch between {producer['id']} and {review_id}")
-    head = workspace_head(producer)
-    if not head.lower().startswith(verdict.reviewed_commit.lower()):
-        raise ValueError(
-            f"reviewed commit {verdict.reviewed_commit} does not match producer {producer['id']} HEAD {head}"
-        )
-    digest = transition_digest(producer, review, verdict)
-    depth = remediation_depth(conn, review_id)
     active = conn.execute(
         "SELECT id, idempotency_key, created_by FROM tasks WHERE status!='archived' AND ("
         "idempotency_key IN (?, ?) OR instr(COALESCE(idempotency_key, ''), ?) = 1 "
-        "OR instr(COALESCE(idempotency_key, ''), ?) = 1 OR instr(COALESCE(idempotency_key, ''), ?) = 1)",
+        "OR instr(COALESCE(idempotency_key, ''), ?) = 1 OR instr(COALESCE(idempotency_key, ''), ?) = 1 "
+        "OR instr(COALESCE(idempotency_key, ''), ?) = 1)",
         (
             f"ttf-remediation-{review_id}",
             f"ttf-rereview-{review_id}",
             f"ttf-remediation-{review_id}-",
             f"ttf-rereview-{review_id}-",
             f"ttf-review-gate-{review_id}-",
+            f"ttf-refresh-review-{review_id}-",
         ),
     ).fetchall()
     if active:
         raise ValueError(f"review {review_id} already has an active or conflicting transition")
+    producer_workspace = workspace(producer).removeprefix("dir:")
+    candidates = conn.execute(
+        "SELECT t.id, t.workspace_path, EXISTS ("
+        "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id) AS same_producer "
+        "FROM tasks t WHERE t.id!=? "
+        "AND t.status NOT IN ('done', 'archived') "
+        "AND (instr(COALESCE(t.idempotency_key, ''), 'ttf-remediation-')=1 "
+        "OR instr(COALESCE(t.idempotency_key, ''), 'ttf-rereview-')=1 "
+        "OR instr(COALESCE(t.idempotency_key, ''), 'ttf-review-gate-')=1 "
+        "OR instr(COALESCE(t.idempotency_key, ''), 'ttf-refresh-review-')=1)",
+        (producer["id"], review_id),
+    ).fetchall()
+    producer_root = Path(producer_workspace)
+    for candidate in candidates:
+        if candidate["same_producer"]:
+            return None
+        if candidate_shares_checkout(candidate, producer_root):
+            return None
+    head = workspace_head(producer)
+    reviewed_head = resolve_reviewed_commit(producer["id"], producer_root, verdict.reviewed_commit)
+    digest = transition_digest(producer, review, verdict, head)
+    depth, refresh_depth = transition_depths(conn, review_id)
     downstream = tuple(
         row[0]
         for row in conn.execute(
@@ -359,7 +528,7 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
             (review_id,),
         )
     )
-    return review, producer, verdict, comment_marker, depth, digest, downstream
+    return review, producer, verdict, comment_marker, depth, digest, downstream, head, refresh_depth, reviewed_head
 
 
 def append_event(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict | None, now: int):
@@ -496,9 +665,41 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
         if not plan:
             conn.rollback()
             return None
-        review, producer, verdict, _marker, depth, digest, downstream = plan
+        review, producer, verdict, _marker, depth, digest, downstream, head, refresh_depth, reviewed_head = plan
         tenant = review["tenant"] or producer["tenant"]
         workspace_path = workspace(producer).removeprefix("dir:")
+        if reviewed_head != head:
+            if refresh_depth >= MAX_REMEDIATION_GENERATIONS:
+                gate = insert_task(
+                    conn,
+                    title=f"Owner input required for repeated stale reviews from {review_id}",
+                    body=stale_review_gate_body(review_id, verdict),
+                    assignee=owner_profile,
+                    status="blocked",
+                    workspace_path=workspace_path,
+                    tenant=tenant,
+                    idempotency_key=f"ttf-review-gate-{review_id}-{digest}",
+                    parents=(producer["id"],),
+                    block_kind="needs_input",
+                    notification_parents=(review_id,),
+                )
+                rewire_and_archive(conn, review_id, gate, downstream, digest)
+                conn.commit()
+                return f"gated stale review {review_id} -> {gate} after {refresh_depth} refreshes"
+            refresh = insert_task(
+                conn,
+                title=f"Refresh stale independent review from {review_id}",
+                body=stale_review_body(review_id, producer["id"], verdict, head),
+                assignee=review["assignee"],
+                status="ready",
+                workspace_path=workspace_path,
+                tenant=tenant,
+                idempotency_key=f"ttf-refresh-review-{review_id}-{digest}",
+                parents=(review_id,),
+            )
+            rewire_and_archive(conn, review_id, refresh, downstream, digest)
+            conn.commit()
+            return f"refreshed stale review {review_id} -> {refresh} at {head}"
         if depth >= MAX_REMEDIATION_GENERATIONS:
             gate = insert_task(
                 conn,
@@ -520,7 +721,7 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
         remediation = insert_task(
             conn,
             title=f"Remediate review findings from {review_id}",
-            body=remediation_body(review_id, producer["id"], verdict),
+            body=remediation_body(review_id, producer["id"], verdict, head),
             assignee=producer["assignee"],
             status="ready",
             workspace_path=workspace_path,
@@ -608,6 +809,7 @@ def reconcile(board: str, home: str, dry_run: bool, owner_profile: str = "orches
                 )
             ]
         messages: list[str] = []
+        reserved_lanes: set[str] = set()
         for review_id in review_ids:
             try:
                 if dry_run:
@@ -615,7 +817,16 @@ def reconcile(board: str, home: str, dry_run: bool, owner_profile: str = "orches
                         conn.row_factory = sqlite3.Row
                         plan = transition_plan(conn, review_id)
                     if plan:
-                        action = "gate" if plan[4] >= MAX_REMEDIATION_GENERATIONS else "remediate"
+                        lane = workspace(plan[1])
+                        if lane in reserved_lanes:
+                            messages.append(f"would defer {review_id} because workspace lane is busy")
+                            continue
+                        reserved_lanes.add(lane)
+                        stale = plan[9] != plan[7]
+                        if stale:
+                            action = "gate stale review" if plan[8] >= MAX_REMEDIATION_GENERATIONS else "refresh"
+                        else:
+                            action = "gate" if plan[4] >= MAX_REMEDIATION_GENERATIONS else "remediate"
                         messages.append(f"would {action} {review_id} with {len(plan[6])} downstream tasks")
                 else:
                     message = apply_transition(db_path, review_id, owner_profile)
@@ -662,7 +873,7 @@ def main() -> int:
     visible = results if args.dry_run else dedupe_runtime_errors(board_db_path(args.home, args.board), results)
     for result in visible:
         print(result)
-    return int(any(result.startswith("error:") for result in visible))
+    return int(any(result.startswith("error:") for result in results))
 
 
 if __name__ == "__main__":

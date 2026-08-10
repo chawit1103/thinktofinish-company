@@ -243,7 +243,7 @@ Enable the board-scoped transition engine after creating a pilot:
 ./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
 ```
 
-It installs one no-agent cron for that board only. Reviewers write a structured `ttf_review` verdict; on `changes_requested`, the engine creates a remediation/re-review pair, rewires downstream dependencies to the replacement review, and archives the rejected review as evidence. After three rejected remediation generations it creates one retained owner-input gate and leaves downstream work gated. It never approves a review, bypasses a typed human/capability gate, deploys, pushes `main`, or handles real credentials/PII.
+It installs one no-agent cron for that board only. Reviewers write a structured `ttf_review` verdict; on `changes_requested`, the engine creates a remediation/re-review pair, rewires downstream dependencies to the replacement review, and archives the rejected review as evidence. It rejects dirty Git handoffs, admits only one active transition per checkout, and replaces a deferred stale verdict with a runnable fresh-review card after an earlier remediation changes `HEAD`. After three rejected remediation or stale-review generations it creates one retained owner-input gate and leaves downstream work gated. It never approves a review, bypasses a typed human/capability gate, deploys, pushes `main`, or handles real credentials/PII.
 
 When upgrading a board that still has a legacy handoff/governor cron, first migrate every reviewer profile to the structured verdict contract above, then take over explicitly:
 
@@ -251,7 +251,7 @@ When upgrading a board that still has a legacy handoff/governor cron, first migr
 ./scripts/enable-kanban-autopilot.sh --profile orchestrator --replace-legacy mini-hrms
 ```
 
-The installer scans every Hermes profile, pauses each matching active legacy job, and converges duplicate/current jobs to one infinite no-agent cron. Re-run the same command for each managed board after updating this plugin so its installed engine copy is refreshed.
+The installer scans every Hermes profile, pauses each matching active legacy job, and converges duplicate/current jobs to one infinite no-agent cron. Each board gets its own atomically replaced engine copy. Re-run the same command for each managed board after updating this plugin so that board's installed engine is refreshed.
 
 ---
 

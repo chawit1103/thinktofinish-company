@@ -2,6 +2,7 @@ import os
 import runpy
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,8 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 ENGINE = runpy.run_path(str(ROOT / "scripts" / "kanban-transition-engine.py"))
+REAL_WORKSPACE_HEAD = ENGINE["workspace_head"]
+REAL_RESOLVE_REVIEWED_COMMIT = ENGINE["resolve_reviewed_commit"]
 VERDICT = '{"ttf_review":{"decision":"changes_requested","reviewed_commit":"abc1234","findings":["Add a regression test"]}}'
 APPROVED = '{"ttf_review":{"decision":"approved","reviewed_commit":"abc1234","findings":[]}}'
 
@@ -16,12 +19,26 @@ APPROVED = '{"ttf_review":{"decision":"approved","reviewed_commit":"abc1234","fi
 @pytest.fixture(autouse=True)
 def stable_test_head(monkeypatch):
     monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "abc1234")
+    monkeypatch.setitem(
+        ENGINE["transition_plan"].__globals__,
+        "resolve_reviewed_commit",
+        lambda task_id, path, commit: commit,
+    )
 
 
 def make_board(tmp_path, board="demo"):
     home = tmp_path / "hermes"
     workspace = home / "worktree"
     workspace.mkdir(parents=True)
+    subprocess.run(["git", "init", str(workspace)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(workspace), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
     db_path = home / "kanban" / "boards" / board / "kanban.db"
     db_path.parent.mkdir(parents=True)
     with sqlite3.connect(db_path) as conn:
@@ -116,6 +133,7 @@ def test_mixed_reviewer_chain_is_rewired_atomically_with_full_context(tmp_path):
         assert remediation["workspace_path"] == str(workspace)
         assert remediation["created_by"] == rereview["created_by"] == "ttf-transition-engine"
         assert "Original producer task: `t_prod`" in remediation["body"]
+        assert "verify the checkout is clean and `HEAD` is `abc1234`" in remediation["body"]
         assert rereview["status"] == "todo" and rereview["assignee"] == "safety-reviewer"
         assert {("t_prod", remediation["id"]), ("t_qa", remediation["id"])} <= links
         assert (remediation["id"], rereview["id"]) in links
@@ -173,7 +191,7 @@ def test_verdict_author_must_match_reviewer(tmp_path):
     assert ENGINE["reconcile"]("demo", str(home), False) == []
 
 
-def test_reviewed_commit_must_match_workspace_head(tmp_path, monkeypatch):
+def test_stale_review_is_planned_for_refresh(tmp_path, monkeypatch):
     home, db_path, workspace = make_board(tmp_path)
     stale = VERDICT.replace("abc1234", "def5678")
     add_tasks(
@@ -186,9 +204,203 @@ def test_reviewed_commit_must_match_workspace_head(tmp_path, monkeypatch):
         [("t_review", stale)],
     )
     monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "abc1234")
-    assert ENGINE["reconcile"]("demo", str(home), True) == [
-        "error: t_review: reviewed commit def5678 does not match producer t_prod HEAD abc1234"
-    ]
+    assert ENGINE["reconcile"]("demo", str(home), True) == ["would refresh t_review with 0 downstream tasks"]
+
+
+def test_stale_review_creates_runnable_refresh_for_real_head(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    reviewed_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    verdict = VERDICT.replace("abc1234", reviewed_head)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", verdict)],
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(workspace), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "other remediation",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    current_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", REAL_WORKSPACE_HEAD)
+    monkeypatch.setitem(
+        ENGINE["transition_plan"].__globals__, "resolve_reviewed_commit", REAL_RESOLVE_REVIEWED_COMMIT
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-%'"
+        ).fetchone()
+        assert result == [f"refreshed stale review t_review -> {refresh['id']} at {current_head}"]
+        assert refresh["status"] == "ready" and refresh["assignee"] == "qa"
+        assert refresh["workspace_path"] == str(workspace)
+
+
+def test_workspace_head_rejects_tracked_untracked_and_hidden_changes(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": str(repo)}
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "wrong-repository"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "wrong-index"))
+    assert REAL_WORKSPACE_HEAD(producer)
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_INDEX_FILE")
+    tracked.write_text("modified\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="workspace is dirty"):
+        REAL_WORKSPACE_HEAD(producer)
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("not reviewed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="workspace is dirty"):
+        REAL_WORKSPACE_HEAD(producer)
+    (repo / "untracked.txt").unlink()
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--assume-unchanged", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    tracked.write_text("hidden\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="hidden Git index flags"):
+        REAL_WORKSPACE_HEAD(producer)
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--no-assume-unchanged", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--skip-worktree", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    tracked.write_text("also hidden\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="hidden Git index flags"):
+        REAL_WORKSPACE_HEAD(producer)
+
+
+def test_workspace_requires_git_checkout_root(tmp_path):
+    _, _, workspace = make_board(tmp_path)
+    nested = workspace / "nested"
+    nested.mkdir()
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": str(nested)}
+    with pytest.raises(ValueError, match="workspace must be the Git checkout root"):
+        ENGINE["workspace"](producer)
+
+
+def test_workspace_head_checks_hidden_changes_inside_submodules(tmp_path):
+    child = tmp_path / "child-source"
+    subprocess.run(["git", "init", str(child)], check=True, capture_output=True)
+    child_file = child / "tracked.txt"
+    child_file.write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(child), "add", "tracked.txt"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(child), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "child",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "protocol.file.allow=always",
+            "submodule", "add", str(child), "child",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "superproject",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo / "child"), "update-index", "--assume-unchanged", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "child" / "tracked.txt").write_text("hidden\n", encoding="utf-8")
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": str(repo)}
+    with pytest.raises(ValueError, match="hidden Git index flags"):
+        REAL_WORKSPACE_HEAD(producer)
+
+
+def test_reviewed_commit_resolution_requires_a_git_object(tmp_path):
+    _, _, workspace = make_board(tmp_path)
+    reviewed = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git", "-C", str(workspace), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "new head",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "branch", reviewed[:7], "HEAD"],
+        check=True,
+        capture_output=True,
+    )
+    assert REAL_RESOLVE_REVIEWED_COMMIT("t_prod", workspace, reviewed[:7]) == reviewed
+    assert REAL_RESOLVE_REVIEWED_COMMIT("t_prod", workspace, "0000000") is None
+
+
+def test_reviewed_commit_resolution_rejects_ambiguous_objects(tmp_path, monkeypatch):
+    _, _, workspace = make_board(tmp_path)
+
+    def ambiguous(_task_id, _path, *args, input_text=None):
+        assert args == ("rev-parse", "--disambiguate=abc1234") and input_text is None
+        return f"{'a' * 40}\n{'b' * 40}\n"
+
+    monkeypatch.setitem(REAL_RESOLVE_REVIEWED_COMMIT.__globals__, "git_output", ambiguous)
+    assert REAL_RESOLVE_REVIEWED_COMMIT("t_prod", workspace, "abc1234") is None
+
+
+def test_workspace_rejects_relative_persistent_path(tmp_path, monkeypatch):
+    (tmp_path / "relative-worktree").mkdir()
+    monkeypatch.chdir(tmp_path)
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": "relative-worktree"}
+    with pytest.raises(ValueError, match="workspace is unavailable"):
+        ENGINE["workspace"](producer)
 
 
 def test_generated_rereview_can_start_a_second_remediation(tmp_path):
@@ -321,6 +533,97 @@ def test_remediation_cap_routes_to_one_sticky_owner_gate(tmp_path):
     assert ENGINE["reconcile"]("demo", str(home), False, "ops-owner") == []
 
 
+def test_stale_refresh_cap_routes_to_owner_gate(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    tasks = [("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None)]
+    links = []
+    comments = []
+    parent = "t_prod"
+    for index in range(4):
+        review = f"t_refresh{index}"
+        key = None if index == 0 else f"ttf-refresh-review-t_refresh{index - 1}-digest"
+        status = "blocked" if index == 3 else "archived"
+        tasks.append((review, status, "qa", "worktree", str(workspace), None, key, None, None))
+        links.append((parent, review))
+        comments.append((review, VERDICT))
+        parent = review
+    tasks.append(("t_next", "todo", "release", "worktree", str(workspace), None, None, None, None))
+    links.append((parent, "t_next"))
+    add_tasks(db_path, tasks, links, comments)
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        gate = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_refresh3-%'"
+        ).fetchone()
+        assert result == [f"gated stale review t_refresh3 -> {gate['id']} after 3 refreshes"]
+        assert gate["status"] == "blocked" and gate["block_kind"] == "needs_input"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_next'", (gate["id"],)
+        ).fetchone()[0] == 1
+
+
+def test_stale_refresh_preserves_remediation_generation_cap(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    tasks = [("t_root", "done", "engineer", "worktree", str(workspace), None, None, None, None)]
+    links = []
+    comments = []
+    parent = "t_root"
+    for index in range(1, 4):
+        review = f"t_rev{index}"
+        remediation = f"t_fix{index}"
+        tasks.extend(
+            [
+                (review, "archived", "qa", "worktree", str(workspace), None, None, None, None),
+                (
+                    remediation, "done", "engineer", "worktree", str(workspace), None,
+                    f"ttf-remediation-{review}-digest", None, None,
+                ),
+            ]
+        )
+        links.extend(((parent, review), (parent, remediation), (review, remediation)))
+        comments.append((review, VERDICT))
+        parent = remediation
+    tasks.extend(
+        [
+            ("t_stale", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_next", "todo", "release", "worktree", str(workspace), None, None, None, None),
+        ]
+    )
+    links.extend(((parent, "t_stale"), ("t_stale", "t_next")))
+    comments.append(("t_stale", VERDICT))
+    add_tasks(db_path, tasks, links, comments)
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    first = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+    assert len(first) == 1 and first[0].startswith("refreshed stale review t_stale -> ")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_stale-%'"
+        ).fetchone()
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (refresh["id"],))
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES (?, 'qa', ?)",
+            (refresh["id"], VERDICT.replace("abc1234", "def5678")),
+        )
+
+    second = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        gate = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE ?",
+            (f"ttf-review-gate-{refresh['id']}-%",),
+        ).fetchone()
+        assert second == [f"gated {refresh['id']} -> {gate['id']} after 3 remediation generations"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ?",
+            (f"ttf-remediation-{refresh['id']}-%",),
+        ).fetchone()[0] == 0
+
+
 def test_one_failed_review_does_not_starve_the_next(tmp_path):
     home, db_path, workspace = make_board(tmp_path)
     tasks = []
@@ -343,6 +646,144 @@ def test_one_failed_review_does_not_starve_the_next(tmp_path):
 
     assert result[0] == "error: t_a111: producer t_p111 has no persistent workspace"
     assert result[1].startswith("remediated t_b222 -> ")
+
+
+def test_shared_workspace_defers_until_fresh_verdict(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review1", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_review2", "blocked", "security", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review1"), ("t_prod", "t_review2")],
+        [("t_review1", VERDICT), ("t_review2", VERDICT)],
+    )
+    head_checks = 0
+    head = "abc1234"
+
+    def checked_head(task):
+        nonlocal head_checks, head
+        head_checks += 1
+        return head
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", checked_head)
+
+    first = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(first) == 1 and first[0].startswith("remediated t_review1 -> ")
+    assert head_checks == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review2'").fetchone()[0] == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review2-%'"
+        ).fetchone()[0] == 0
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE idempotency_key LIKE 'ttf-remediation-t_review1-%'"
+        )
+
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    assert head_checks == 1
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE created_by='ttf-transition-engine'")
+
+    head = "def5678"
+    refresh_result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(refresh_result) == 1 and refresh_result[0].startswith("refreshed stale review t_review2 -> ")
+    assert head_checks == 2
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review2-%'"
+        ).fetchone()
+        assert refresh["status"] == "ready" and refresh["assignee"] == "security"
+        assert "clean checkout is now `def5678`" in refresh["body"]
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review2'").fetchone()[0] == "archived"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_review2' AND child_id=?", (refresh["id"],)
+        ).fetchone()[0] == 1
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (refresh["id"],))
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES (?, 'security', ?)",
+            (refresh["id"], VERDICT.replace("abc1234", "def5678")),
+        )
+
+    remediated = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(remediated) == 1 and remediated[0].startswith(f"remediated {refresh['id']} -> ")
+    assert head_checks == 3
+
+
+def test_dry_run_reserves_one_shared_workspace_lane(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review1", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_review2", "blocked", "security", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review1"), ("t_prod", "t_review2")],
+        [("t_review1", VERDICT), ("t_review2", VERDICT)],
+    )
+
+    assert ENGINE["reconcile"]("demo", str(home), True) == [
+        "would remediate t_review1 with 0 downstream tasks",
+        "would defer t_review2 because workspace lane is busy",
+    ]
+
+
+def test_legacy_transition_in_same_checkout_defers_before_head_probe(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    nested = workspace / "nested"
+    nested.mkdir()
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_legacy", "running", "engineer", "dir", str(nested), None,
+                "ttf-remediation-t_other", None, None,
+            ),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET created_by='orchestrator' WHERE id='t_legacy'")
+
+    def unexpected_head(_task):
+        raise AssertionError("busy lanes must defer before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_unverifiable_active_transition_fails_closed_before_head_probe(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    not_git = tmp_path / "not-git"
+    not_git.mkdir()
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_broken", "running", "engineer", "dir", str(not_git), None,
+                "ttf-remediation-t_other", None, None,
+            ),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+
+    def unexpected_head(_task):
+        raise AssertionError("unverifiable active lanes must fail before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == [
+        "error: t_review: active transition t_broken has an unverifiable workspace"
+    ]
 
 
 def test_unassigned_review_isolated_from_later_work(tmp_path):
@@ -445,6 +886,29 @@ def test_runtime_errors_are_emitted_once_until_resolved(tmp_path):
     assert ENGINE["dedupe_runtime_errors"](state, [error]) == []
     assert ENGINE["dedupe_runtime_errors"](state, []) == []
     assert ENGINE["dedupe_runtime_errors"](state, [error]) == [error]
+
+
+def test_deduplicated_runtime_error_keeps_failing_exit_status(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "scratch", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "scratch", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+    command = [
+        sys.executable, str(ROOT / "scripts" / "kanban-transition-engine.py"),
+        "--board", "demo", "--home", str(home),
+    ]
+
+    first = subprocess.run(command, text=True, capture_output=True)
+    second = subprocess.run(command, text=True, capture_output=True)
+    assert first.returncode == second.returncode == 1
+    assert "no persistent workspace" in first.stdout
+    assert second.stdout == ""
 
 
 def test_default_board_path(tmp_path):
@@ -569,11 +1033,64 @@ exit 0
     assert "-p orchestrator cron resume bbb222" in commands
     assert " cron create " not in commands
     wrapper = home / "profiles" / "orchestrator" / "scripts" / "ttf-demo-transition-engine.py"
+    core = home / "profiles" / "orchestrator" / "scripts" / "ttf-demo-transition-engine-core.py"
     wrapper_text = wrapper.read_text(encoding="utf-8")
+    assert core.read_bytes() == (ROOT / "scripts" / "kanban-transition-engine.py").read_bytes()
+    assert str(core) in wrapper_text
     assert "sys.executable" in wrapper_text
     assert "'--owner-profile', 'orchestrator'" in wrapper_text
     assert f"os.environ['HERMES_KANBAN_DB'] = '{db_path}'" in wrapper_text
     assert "HERMES_KANBAN_TASK" in wrapper_text and "os.environ.pop" in wrapper_text
+
+
+def test_installer_keeps_engine_copies_isolated_per_board(tmp_path):
+    home, demo_db, _ = make_board(tmp_path)
+    other_db = home / "kanban" / "boards" / "other" / "kanban.db"
+    other_db.parent.mkdir(parents=True)
+    with sqlite3.connect(demo_db) as source, sqlite3.connect(other_db) as destination:
+        source.backup(destination)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' \
+    '  aaa111 [active]' '    Name:      ttf-demo-transition-engine' \
+    '  bbb222 [active]' '    Name:      ttf-other-transition-engine'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_TASK"):
+        env.pop(key, None)
+    installer = str(ROOT / "scripts" / "enable-kanban-autopilot.sh")
+
+    first = subprocess.run(
+        [installer, "--profile", "orchestrator", "demo"], text=True, capture_output=True, env=env
+    )
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    demo_core = scripts / "ttf-demo-transition-engine-core.py"
+    demo_wrapper = scripts / "ttf-demo-transition-engine.py"
+    assert first.returncode == 0, first.stderr
+    assert demo_core.read_bytes() == (ROOT / "scripts" / "kanban-transition-engine.py").read_bytes()
+    demo_core.write_text("demo sentinel\n", encoding="utf-8")
+    demo_wrapper_before = demo_wrapper.read_bytes()
+
+    second = subprocess.run(
+        [installer, "--profile", "orchestrator", "other"], text=True, capture_output=True, env=env
+    )
+    other_core = scripts / "ttf-other-transition-engine-core.py"
+    other_wrapper = scripts / "ttf-other-transition-engine.py"
+    assert second.returncode == 0, second.stderr
+    assert demo_core.read_text(encoding="utf-8") == "demo sentinel\n"
+    assert demo_wrapper.read_bytes() == demo_wrapper_before
+    assert other_core.read_bytes() == (ROOT / "scripts" / "kanban-transition-engine.py").read_bytes()
+    assert str(other_core) in other_wrapper.read_text(encoding="utf-8")
+    assert str(demo_core) not in other_wrapper.read_text(encoding="utf-8")
 
 
 def test_installer_leaves_legacy_active_when_replacement_fails(tmp_path):
