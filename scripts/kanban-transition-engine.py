@@ -27,6 +27,8 @@ def parse_review_verdict(comment: str) -> ReviewVerdict | None:
         raw = json.loads(comment)["ttf_review"]
     except (KeyError, TypeError, json.JSONDecodeError):
         return None
+    if not isinstance(raw, dict):
+        return None
     decision = raw.get("decision")
     commit = raw.get("reviewed_commit")
     findings = raw.get("findings")
@@ -82,6 +84,24 @@ def workspace(task: sqlite3.Row) -> str:
     return f"dir:{path}" if path else "scratch"
 
 
+def remediation_producer(conn: sqlite3.Connection, review: sqlite3.Row) -> sqlite3.Row | None:
+    """Walk through reviewer-only gates to the nearest independent producer."""
+    current = review
+    seen = {review["id"]}
+    while True:
+        parents = conn.execute(
+            "SELECT p.* FROM task_links l JOIN tasks p ON p.id=l.parent_id WHERE l.child_id=?",
+            (current["id"],),
+        ).fetchall()
+        if len(parents) != 1 or parents[0]["id"] in seen:
+            return None
+        parent = parents[0]
+        if parent["assignee"] != review["assignee"]:
+            return parent
+        seen.add(parent["id"])
+        current = parent
+
+
 def reconcile(board: str, home: str, dry_run: bool) -> list[str]:
     db_path = Path(home) / "kanban" / "boards" / board / "kanban.db"
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
@@ -94,13 +114,11 @@ def reconcile(board: str, home: str, dry_run: bool) -> list[str]:
             verdict = latest_verdict(conn, review["id"])
             if not verdict or verdict.decision != "changes_requested":
                 continue
-            parents = conn.execute(
-                "SELECT p.* FROM task_links l JOIN tasks p ON p.id=l.parent_id WHERE l.child_id=?", (review["id"],)
-            ).fetchall()
-            if len(parents) != 1:
+            producer = remediation_producer(conn, review)
+            if producer is None:
                 continue
             children = tuple(row[0] for row in conn.execute("SELECT child_id FROM task_links WHERE parent_id=?", (review["id"],)))
-            planned.append((review, parents[0], children, verdict))
+            planned.append((review, producer, children, verdict))
 
     completed: list[str] = []
     for review, producer, children, verdict in planned:
@@ -134,8 +152,8 @@ def reconcile(board: str, home: str, dry_run: bool) -> list[str]:
             capture=True,
         ))
         for child in children:
-            command(board, home, "unlink", review["id"], child)
             command(board, home, "link", follow_up, child)
+            command(board, home, "unlink", review["id"], child)
         command(board, home, "archive", review["id"])
         completed.append(f"remediated {review['id']} -> {remediation} -> {follow_up}")
     return completed
@@ -152,6 +170,7 @@ def main() -> int:
         verdict = parse_review_verdict('{"ttf_review":{"decision":"changes_requested","reviewed_commit":"abc1234","findings":["Add a regression test"]}}')
         assert verdict and "Add a regression test" in remediation_body("t_review", verdict)
         assert parse_review_verdict("REQUEST_CHANGES") is None
+        assert parse_review_verdict('{"ttf_review":[]}') is None
         assert parse_review_verdict('{"ttf_review":{"decision":"changes_requested","reviewed_commit":"abc1234","findings":[]}}') is None
         print("self-test passed")
         return 0
