@@ -469,6 +469,32 @@ def test_human_gate_is_not_automated(tmp_path):
     assert ENGINE["reconcile"]("demo", str(home), False) == []
 
 
+def test_retained_engine_gate_does_not_reserve_the_checkout(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_gate", "blocked", "orchestrator", "dir", str(workspace), None,
+                "ttf-review-gate-t_old-digest", "needs_input", None,
+            ),
+            ("t_gated", "todo", "release", "dir", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review"), ("t_prod", "t_gate"), ("t_gate", "t_gated")],
+        [("t_review", VERDICT)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(result) == 1 and result[0].startswith("remediated t_review -> ")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_gate'").fetchone()[0] == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_gate' AND child_id='t_gated'"
+        ).fetchone()[0] == 1
+
+
 def test_remediation_cap_routes_to_one_sticky_owner_gate(tmp_path):
     home, db_path, workspace = make_board(tmp_path)
     tasks = [("t_root", "done", "engineer", "worktree", str(workspace), None, None, None, None)]
@@ -977,6 +1003,26 @@ def test_deduplicated_runtime_error_keeps_failing_exit_status(tmp_path):
 
 def test_default_board_path(tmp_path):
     assert ENGINE["board_db_path"](str(tmp_path), "Default") == tmp_path / "kanban.db"
+
+
+@pytest.mark.parametrize("reserved", ["#", "?"])
+def test_read_only_database_uri_encodes_reserved_path_characters(tmp_path, reserved):
+    scope = tmp_path / f"scope{reserved}tail"
+    home, db_path, workspace = make_board(scope)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+
+    assert ENGINE["reconcile"]("demo", str(home), True) == [
+        "would remediate t_review with 0 downstream tasks"
+    ]
+    assert not (tmp_path / "scope").exists()
 
 
 def test_installer_rejects_missing_board_before_writes(tmp_path):

@@ -155,6 +155,10 @@ def board_db_path(home: str, board: str) -> Path:
     return root / "kanban.db" if slug == "default" else root / "kanban" / "boards" / slug / "kanban.db"
 
 
+def readonly_db_uri(db_path: Path) -> str:
+    return f"{db_path.resolve().as_uri()}?mode=ro"
+
+
 def check_board(home: str, board: str) -> Path:
     db_path = board_db_path(home, board)
     if not db_path.is_file():
@@ -173,7 +177,7 @@ def check_board(home: str, board: str) -> Path:
             "created_at", "last_event_id",
         },
     }
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+    with sqlite3.connect(readonly_db_uri(db_path), uri=True) as conn:
         for table, columns in required.items():
             present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             missing = sorted(columns - present)
@@ -521,10 +525,10 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
         "WHERE pl.child_id=t.id AND p.status NOT IN ('done', 'archived')) AS parents_terminal "
         "FROM tasks t WHERE t.id!=?) "
         "SELECT id, workspace_path, same_producer, engine_transition FROM candidates WHERE "
-        "(status NOT IN ('done', 'archived') AND engine_transition) OR ("
         "(current_run_id IS NOT NULL OR status IN ('running', 'review') "
         "OR (status IN ('todo', 'ready') AND parents_terminal)) "
-        "AND (same_producer OR (workspace_kind IN ('dir', 'worktree') AND workspace_path IS NOT NULL)))",
+        "AND (engine_transition OR same_producer "
+        "OR (workspace_kind IN ('dir', 'worktree') AND workspace_path IS NOT NULL))",
         (producer["id"], review_id),
     ).fetchall()
     producer_root = Path(producer_workspace)
@@ -819,7 +823,7 @@ def reconcile(board: str, home: str, dry_run: bool, owner_profile: str = "orches
     with board_lock(db_path) as acquired:
         if not acquired:
             return [LOCK_BUSY]
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        with sqlite3.connect(readonly_db_uri(db_path), uri=True) as conn:
             review_ids = [
                 row[0]
                 for row in conn.execute(
@@ -832,7 +836,7 @@ def reconcile(board: str, home: str, dry_run: bool, owner_profile: str = "orches
         for review_id in review_ids:
             try:
                 if dry_run:
-                    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                    with sqlite3.connect(readonly_db_uri(db_path), uri=True) as conn:
                         conn.row_factory = sqlite3.Row
                         plan = transition_plan(conn, review_id)
                     if plan:

@@ -12,6 +12,7 @@ never_block_for:
   - dependency_waiting
   - independent_review_waiting
   - review_required_handoff
+  - review_request_changes
   - ordinary_technical_decision
   - routine_tool_approval_timeout
 actions:

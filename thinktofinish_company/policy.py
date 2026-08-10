@@ -24,7 +24,8 @@ def check_policy(action: str, risk: str = "medium", context: str = "") -> dict[s
         reasons.append("Action is not explicitly classified; conservative default applied.")
 
     risk_level = risk.strip().lower()
-    if risk_level in {"high", "critical"} and decision == "autonomous":
+    never_block = set(kanban.get("never_block_for", []))
+    if risk_level in {"high", "critical"} and decision == "autonomous" and normalized not in never_block:
         decision = "human_approval"
         reasons.append("High/critical risk upgrades autonomous action to human approval.")
 
