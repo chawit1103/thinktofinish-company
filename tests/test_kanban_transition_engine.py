@@ -1,8 +1,10 @@
+import json
 import os
 import runpy
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -68,6 +70,27 @@ def make_board(tmp_path, board="demo"):
             """
         )
     return home, db_path, workspace
+
+
+def add_cron_job(home, job_id, name, profile="orchestrator", **overrides):
+    profile_home = home if profile == "default" else home / "profiles" / profile
+    jobs_path = profile_home / "cron" / "jobs.json"
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.loads(jobs_path.read_text(encoding="utf-8")) if jobs_path.exists() else {"jobs": []}
+    job = {
+        "id": job_id,
+        "name": name,
+        "schedule": {"kind": "interval", "minutes": 17, "display": "every 17m"},
+        "schedule_display": "every 17m",
+        "repeat": {"times": 7, "completed": 2},
+        "script": "old-engine.py",
+        "no_agent": False,
+        "enabled": True,
+        "state": "scheduled",
+    }
+    job.update(overrides)
+    payload["jobs"].append(job)
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def add_tasks(db_path, tasks, links=(), comments=()):
@@ -2166,6 +2189,60 @@ def test_installer_rejects_missing_board_before_writes(tmp_path):
     assert not (home / "scripts").exists()
 
 
+@pytest.mark.parametrize("database_source", ["derived-symlink", "explicit-symlink"])
+def test_installer_rejects_concurrent_install_for_same_canonical_board_database(
+    tmp_path, database_source
+):
+    import fcntl
+
+    home, db_path, _ = make_board(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERMES_TEST_LOG\"\nexit 0\n",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    alias_home = tmp_path / "alias-home"
+    derived_alias = alias_home / "kanban" / "boards" / "demo" / "kanban.db"
+    derived_alias.parent.mkdir(parents=True)
+    derived_alias.symlink_to(db_path)
+    explicit_alias = tmp_path / "explicit-kanban.db"
+    explicit_alias.symlink_to(db_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HERMES_HOME": str(home),
+        "HERMES_TEST_LOG": str(log),
+    }
+    env.pop("HERMES_KANBAN_HOME", None)
+    env.pop("HERMES_KANBAN_DB", None)
+    if database_source == "derived-symlink":
+        env["HERMES_KANBAN_HOME"] = str(alias_home)
+    else:
+        env["HERMES_KANBAN_DB"] = str(explicit_alias)
+    lock = Path(f"{db_path}.ttf-install.lock").open("a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            [
+                str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+                "--profile", "developer", "demo",
+            ],
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+    finally:
+        lock.close()
+
+    assert result.returncode == 1
+    assert "already running" in result.stderr
+    assert "cron list" not in log.read_text(encoding="utf-8")
+
+
 def test_installer_requires_explicit_legacy_takeover(tmp_path):
     home, _, _ = make_board(tmp_path)
     fake_bin = tmp_path / "bin"
@@ -2193,8 +2270,55 @@ exit 0
     assert not (home / "profiles" / "orchestrator" / "scripts").exists()
 
 
-def test_installer_pauses_legacy_and_resumes_exact_job(tmp_path):
+def test_installer_snapshot_failure_does_not_mutate_cron(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert "Could not snapshot" in result.stderr
+    assert "cron pause" not in commands and "cron resume" not in commands and "cron edit" not in commands
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    assert not (scripts / "ttf-demo-transition-engine.py").exists()
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+
+
+def test_installer_parks_legacy_and_activates_exact_job(tmp_path):
     home, db_path, workspace = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    add_cron_job(home, "aaa222", "demo-graph-governor")
+    add_cron_job(home, "ccc333", "ttf-demo-graph-governor", profile="default")
     # A malformed legacy review must not prevent installing the recovery engine.
     add_tasks(
         db_path,
@@ -2204,23 +2328,17 @@ def test_installer_pauses_legacy_and_resumes_exact_job(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
-    state = tmp_path / "cron-active"
     hermes = fake_bin / "hermes"
     hermes.write_text(
         """#!/bin/sh
 printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
-if [ "$*" = "-p orchestrator cron resume bbb222" ]; then
-  : > "$HERMES_TEST_STATE"
-fi
 if [ "$*" = "-p orchestrator cron list --all" ]; then
-  current=paused
-  [ -f "$HERMES_TEST_STATE" ] && current=active
   printf '%s\n' \
     '  aaa111 [active]' \
     '    Name:      demo-graph-governor' \
     '  aaa222 [active]' \
     '    Name:      demo-graph-governor' \
-    "  bbb222 [$current]" \
+    '  bbb222 [active]' \
     '    Name:      ttf-demo-transition-engine'
 fi
 if [ "$*" = "-p default cron list --all" ]; then
@@ -2236,7 +2354,6 @@ exit 0
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "HERMES_HOME": str(home),
         "HERMES_TEST_LOG": str(log),
-        "HERMES_TEST_STATE": str(state),
     }
     env.pop("HERMES_KANBAN_DB", None)
     env.pop("HERMES_KANBAN_HOME", None)
@@ -2253,25 +2370,28 @@ exit 0
 
     commands = log.read_text(encoding="utf-8")
     assert result.returncode == 0, result.stderr
-    assert "-p orchestrator cron pause aaa111" in commands
-    assert "-p orchestrator cron pause aaa222" in commands
-    assert "-p default cron pause ccc333" in commands
+    assert "cron pause aaa111" not in commands and "cron resume aaa111" not in commands
+    assert "cron pause aaa222" not in commands and "cron resume aaa222" not in commands
+    assert "cron pause ccc333" not in commands and "cron resume ccc333" not in commands
+    assert commands.count("-p orchestrator cron status") >= 4
+    assert "-p default cron status" in commands
     assert "-p orchestrator cron edit bbb222 --schedule every 1m --script ttf-demo-transition-engine.py --no-agent --repeat 0" in commands
     assert "--monitor-script  --monitor-url" in commands
-    assert "-p orchestrator cron resume bbb222" in commands
     assert " cron create " not in commands
-    command_lines = commands.splitlines()
-    edit_index = next(i for i, line in enumerate(command_lines) if "cron edit bbb222" in line)
-    resume_index = command_lines.index("-p orchestrator cron resume bbb222")
-    legacy_pause_indexes = [
-        command_lines.index(command)
-        for command in (
-            "-p orchestrator cron pause aaa111",
-            "-p orchestrator cron pause aaa222",
-            "-p default cron pause ccc333",
-        )
-    ]
-    assert edit_index < min(legacy_pause_indexes) < max(legacy_pause_indexes) < resume_index
+    orchestrator_jobs = json.loads(
+        (home / "profiles" / "orchestrator" / "cron" / "jobs.json").read_text(encoding="utf-8")
+    )["jobs"]
+    default_jobs = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8"))["jobs"]
+    parked = {
+        job["id"]: (job["enabled"], job["state"])
+        for job in [*orchestrator_jobs, *default_jobs]
+        if job["id"] in {"aaa111", "aaa222", "ccc333"}
+    }
+    assert parked == {
+        "aaa111": (False, "paused"),
+        "aaa222": (False, "paused"),
+        "ccc333": (False, "paused"),
+    }
     wrapper = home / "profiles" / "orchestrator" / "scripts" / "ttf-demo-transition-engine.py"
     core = home / "profiles" / "orchestrator" / "scripts" / "ttf-demo-transition-engine-core.py"
     wrapper_text = wrapper.read_text(encoding="utf-8")
@@ -2284,8 +2404,9 @@ exit 0
     assert list(wrapper.parent.glob(".ttf-demo-engine-rollback.*")) == []
 
 
-def test_installer_pauses_legacy_before_fresh_replacement_create(tmp_path):
+def test_installer_parks_legacy_before_fresh_replacement_create(tmp_path):
     home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "aaa111", "demo-graph-governor")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
@@ -2302,14 +2423,17 @@ if [ "$*" = "-p orchestrator cron list --all" ]; then
     printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
   fi
 fi
-if [ "$*" = "-p orchestrator cron pause aaa111" ]; then
-  : > "$HERMES_TEST_LEGACY_PAUSED"
-fi
-if [ "$*" = "-p orchestrator cron create --name ttf-demo-transition-engine --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m" ]; then
-  [ -f "$HERMES_TEST_LEGACY_PAUSED" ] || exit 9
-  : > "$HERMES_TEST_REPLACEMENT_ACTIVE"
-  printf '%s\n' 'Created job: bbb222'
-fi
+case "$*" in
+  "-p orchestrator cron create --name ttf-demo-transition-engine-install-"*" --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m")
+  python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+job = next(job for job in json.load(open(sys.argv[1], encoding="utf-8"))["jobs"] if job["id"] == "aaa111")
+assert job["enabled"] is False and job["state"] == "paused"
+PY
+    : > "$HERMES_TEST_LEGACY_PAUSED"
+    : > "$HERMES_TEST_REPLACEMENT_ACTIVE"
+    printf '%s\n' 'Created job: bbb222' ;;
+esac
 exit 0
 """,
         encoding="utf-8",
@@ -2327,6 +2451,7 @@ exit 0
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "HERMES_HOME": str(home),
             "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(home / "profiles" / "orchestrator" / "cron" / "jobs.json"),
             "HERMES_TEST_LEGACY_PAUSED": str(legacy_paused),
             "HERMES_TEST_REPLACEMENT_ACTIVE": str(replacement_active),
         },
@@ -2334,13 +2459,117 @@ exit 0
 
     commands = log.read_text(encoding="utf-8").splitlines()
     assert result.returncode == 0, result.stderr
-    pause_index = commands.index("-p orchestrator cron pause aaa111")
     create_index = next(i for i, line in enumerate(commands) if "cron create --name" in line)
-    assert pause_index < create_index
+    status_index = max(
+        i for i, line in enumerate(commands[:create_index]) if line == "-p orchestrator cron status"
+    )
+    assert status_index < create_index
+    assert any("--name ttf-demo-transition-engine-install-" in line for line in commands)
+    assert "-p orchestrator cron edit bbb222 --name ttf-demo-transition-engine" in commands
+    legacy = json.loads(
+        (home / "profiles" / "orchestrator" / "cron" / "jobs.json").read_text(encoding="utf-8")
+    )["jobs"][0]
+    assert legacy["enabled"] is False and legacy["state"] == "paused"
+
+
+def test_installer_keeps_its_created_job_when_same_name_job_races(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    created = tmp_path / "created"
+    competitor_paused = tmp_path / "competitor-paused"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  aaa111 [active]' '    Name:      demo-graph-governor'
+  if [ -f "$HERMES_TEST_CREATED" ]; then
+    [ -f "$HERMES_TEST_COMPETITOR_PAUSED" ] || \
+      printf '%s\n' '  ccc333 [active]' '    Name:      ttf-demo-transition-engine'
+    printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+  fi
+fi
+case "$*" in
+  "-p orchestrator cron create --name ttf-demo-transition-engine-install-"*" --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m")
+    python3 - "$HERMES_TEST_JOBS" "$6" <<'PY'
+import copy, json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+template = payload["jobs"][0]
+for job_id, name in (("ccc333", "ttf-demo-transition-engine"), ("bbb222", sys.argv[2])):
+    job = copy.deepcopy(template)
+    job.update({"id": job_id, "name": name, "enabled": True, "state": "scheduled"})
+    job.pop("paused_at", None)
+    job.pop("paused_reason", None)
+    payload["jobs"].append(job)
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    : > "$HERMES_TEST_CREATED"
+    printf '%s\n' 'Created job: bbb222' ;;
+  "-p orchestrator cron edit bbb222 --name ttf-demo-transition-engine")
+    python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+next(job for job in payload["jobs"] if job["id"] == "bbb222")["name"] = "ttf-demo-transition-engine"
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    ;;
+esac
+if [ "$*" = "-p orchestrator cron status" ] && python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+raise SystemExit(not any(job.get("id") == "ccc333" and job.get("state") == "paused" for job in jobs))
+PY
+then
+  : > "$HERMES_TEST_COMPETITOR_PAUSED"
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(home / "profiles" / "orchestrator" / "cron" / "jobs.json"),
+            "HERMES_TEST_CREATED": str(created),
+            "HERMES_TEST_COMPETITOR_PAUSED": str(competitor_paused),
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stderr
+    assert competitor_paused.is_file()
+    assert "cron pause ccc333" not in commands and "cron pause bbb222" not in commands
+    assert "-p orchestrator cron edit bbb222 --name ttf-demo-transition-engine" in commands
+    jobs = {
+        job["id"]: job
+        for job in json.loads(
+            (home / "profiles" / "orchestrator" / "cron" / "jobs.json").read_text(encoding="utf-8")
+        )["jobs"]
+    }
+    assert jobs["ccc333"]["enabled"] is False and jobs["ccc333"]["state"] == "paused"
+    assert jobs["bbb222"]["enabled"] is True and jobs["bbb222"]["state"] == "scheduled"
 
 
 def test_installer_keeps_engine_copies_isolated_per_board(tmp_path):
     home, demo_db, _ = make_board(tmp_path)
+    add_cron_job(home, "aaa111", "ttf-demo-transition-engine")
+    add_cron_job(home, "bbb222", "ttf-other-transition-engine")
     other_db = home / "kanban" / "boards" / "other" / "kanban.db"
     other_db.parent.mkdir(parents=True)
     with sqlite3.connect(demo_db) as source, sqlite3.connect(other_db) as destination:
@@ -2391,6 +2620,7 @@ exit 0
 
 def test_installer_leaves_legacy_active_when_replacement_fails(tmp_path):
     home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
     scripts = home / "profiles" / "orchestrator" / "scripts"
     scripts.mkdir(parents=True)
     old_wrapper = scripts / "ttf-demo-transition-engine.py"
@@ -2409,7 +2639,7 @@ if [ "$*" = "-p orchestrator cron list --all" ]; then
     '  aaa111 [active]' '    Name:      demo-graph-governor' \
     '  bbb222 [paused]' '    Name:      ttf-demo-transition-engine'
 fi
-case "$*" in "-p orchestrator cron edit "*) exit 1 ;; esac
+case "$*" in "-p orchestrator cron edit bbb222 --schedule every 1m "*) exit 1 ;; esac
 exit 0
 """,
         encoding="utf-8",
@@ -2439,7 +2669,12 @@ exit 0
 
 
 def test_installer_restores_active_engine_when_interrupted(tmp_path):
-    home, _, _ = make_board(tmp_path)
+    import fcntl
+
+    home, db_path, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_job = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
     scripts = home / "profiles" / "orchestrator" / "scripts"
     scripts.mkdir(parents=True)
     old_wrapper = scripts / "ttf-demo-transition-engine.py"
@@ -2449,6 +2684,7 @@ def test_installer_restores_active_engine_when_interrupted(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
+    ready = tmp_path / "ready-for-term"
     hermes = fake_bin / "hermes"
     hermes.write_text(
         """#!/bin/sh
@@ -2457,8 +2693,107 @@ if [ "$*" = "-p orchestrator cron list --all" ]; then
   printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
 fi
 case "$*" in
-  "-p orchestrator cron edit "*) kill -TERM "$PPID"; sleep 0.1; exit 143 ;;
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+payload["jobs"][0].update({"script": "replacement.py", "no_agent": True, "repeat": {"times": None, "completed": 2}})
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    : > "$HERMES_TEST_READY"
+    sleep 0.5 ;;
 esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    process = subprocess.Popen(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_READY": str(ready),
+        },
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not ready.exists():
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=10)
+        pytest.fail(f"installer did not reach the mutation boundary: {stdout}\n{stderr}")
+    process.terminate()
+    stdout, stderr = process.communicate(timeout=10)
+
+    commands = log.read_text(encoding="utf-8")
+    assert process.returncode == 143, (stdout, stderr)
+    assert commands.count("-p orchestrator cron status") >= 2
+    assert "cron resume bbb222" not in commands
+    assert old_wrapper.read_text(encoding="utf-8") == "signal old wrapper\n"
+    assert old_core.read_text(encoding="utf-8") == "signal old core\n"
+    assert json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"] == [original_job]
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+    with Path(f"{db_path}.ttf-install.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize(
+    ("target_id", "target_name", "extra_args"),
+    [
+        ("ccc333", "ttf-demo-transition-engine", []),
+        ("aaa111", "demo-graph-governor", ["--replace-legacy"]),
+    ],
+)
+def test_installer_restores_managed_pause_target_when_provider_sync_fails(
+    tmp_path, target_id, target_name, extra_args
+):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, target_id, target_name)
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  state=active; [ ! -f "$HERMES_TEST_PAUSED" ] || state=paused
+  printf '%s\n' \
+    '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
+    "  $HERMES_TEST_TARGET [$state]" "    Name:      $HERMES_TEST_TARGET_NAME"
+fi
+if [ "$*" = "-p orchestrator cron status" ] && [ ! -f "$HERMES_TEST_PAUSED" ] && \
+   python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_TARGET" <<'PY'
+import json, sys
+jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+raise SystemExit(not any(
+    job.get("id") == sys.argv[2] and job.get("enabled") is False and job.get("state") == "paused"
+    for job in jobs
+))
+PY
+then
+  : > "$HERMES_TEST_PAUSED"
+  exit 1
+fi
 exit 0
 """,
         encoding="utf-8",
@@ -2468,7 +2803,7 @@ exit 0
     result = subprocess.run(
         [
             str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
-            "--profile", "orchestrator", "demo",
+            "--profile", "orchestrator", *extra_args, "demo",
         ],
         text=True,
         capture_output=True,
@@ -2477,15 +2812,24 @@ exit 0
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "HERMES_HOME": str(home),
             "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_TARGET": target_id,
+            "HERMES_TEST_TARGET_NAME": target_name,
+            "HERMES_TEST_PAUSED": str(tmp_path / "paused"),
         },
     )
 
     commands = log.read_text(encoding="utf-8")
-    assert result.returncode == 143
-    assert "cron pause bbb222" in commands and "cron resume bbb222" in commands
-    assert old_wrapper.read_text(encoding="utf-8") == "signal old wrapper\n"
-    assert old_core.read_text(encoding="utf-8") == "signal old core\n"
-    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+    assert result.returncode != 0
+    assert "-p orchestrator cron status" in commands
+    assert f"cron pause {target_id}" not in commands
+    assert f"cron resume {target_id}" not in commands
+    restored_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    assert restored_target == original_target
 
 
 @pytest.mark.parametrize("preexisting_files", [False, True])
@@ -2509,12 +2853,13 @@ def test_installer_discovers_fresh_job_when_create_is_interrupted(tmp_path, pree
 printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
 if [ "$*" = "-p orchestrator cron list --all" ]; then
   if [ -f "$HERMES_TEST_ACTIVE" ] && [ ! -f "$HERMES_TEST_PAUSED" ]; then
-    printf '%s\n' '  abc999 [active]' '    Name:      ttf-demo-transition-engine'
+    printf '%s\n' '  abc999 [active]' "    Name:      $(cat "$HERMES_TEST_CREATE_NAME")"
   fi
   exit 0
 fi
 case "$*" in
-  "-p orchestrator cron create --name ttf-demo-transition-engine --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m")
+  "-p orchestrator cron create --name ttf-demo-transition-engine-install-"*" --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m")
+    printf '%s' "$6" > "$HERMES_TEST_CREATE_NAME"
     : > "$HERMES_TEST_ACTIVE"
     printf '%s\n' 'Created job: abc999'
     kill -TERM "$PPID"
@@ -2535,6 +2880,7 @@ exit 0
         "HERMES_TEST_LOG": str(log),
         "HERMES_TEST_ACTIVE": str(active),
         "HERMES_TEST_PAUSED": str(paused),
+        "HERMES_TEST_CREATE_NAME": str(tmp_path / "create-name"),
     }
     for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_TASK"):
         env.pop(key, None)
@@ -2574,6 +2920,14 @@ exit 0
 
 def test_installer_rolls_back_replacement_when_activation_cannot_be_verified(tmp_path):
     home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
@@ -2607,8 +2961,14 @@ exit 0
     )
     commands = log.read_text(encoding="utf-8")
     assert result.returncode != 0
-    assert "cron resume bbb222" in commands and "cron pause bbb222" in commands
-    assert "cron pause aaa111" in commands and "cron resume aaa111" in commands
+    assert commands.count("-p orchestrator cron status") >= 5
+    assert "cron pause aaa111" not in commands and "cron resume aaa111" not in commands
+    restored_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
+    assert restored_legacy == original_legacy
     scripts = home / "profiles" / "orchestrator" / "scripts"
     assert not (scripts / "ttf-demo-transition-engine.py").exists()
     assert not (scripts / "ttf-demo-transition-engine-core.py").exists()
@@ -2617,19 +2977,26 @@ exit 0
 
 def test_installer_rolls_back_replacement_when_verification_list_fails(tmp_path):
     home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
-    resumed = tmp_path / "resumed"
+    list_count = tmp_path / "list-count"
     hermes = fake_bin / "hermes"
     hermes.write_text(
         """#!/bin/sh
 printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
-if [ "$*" = "-p orchestrator cron resume bbb222" ]; then
-  : > "$HERMES_TEST_STATE"
-fi
 if [ "$*" = "-p orchestrator cron list --all" ]; then
-  [ -f "$HERMES_TEST_STATE" ] && exit 1
+  count=0; [ ! -f "$HERMES_TEST_LIST_COUNT" ] || count=$(cat "$HERMES_TEST_LIST_COUNT")
+  count=$((count + 1)); printf '%s' "$count" > "$HERMES_TEST_LIST_COUNT"
+  [ "$count" -eq 2 ] && exit 1
   printf '%s\n' \
     '  aaa111 [active]' '    Name:      demo-graph-governor' \
     '  bbb222 [paused]' '    Name:      ttf-demo-transition-engine'
@@ -2651,17 +3018,31 @@ exit 0
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "HERMES_HOME": str(home),
             "HERMES_TEST_LOG": str(log),
-            "HERMES_TEST_STATE": str(resumed),
+            "HERMES_TEST_LIST_COUNT": str(list_count),
         },
     )
     commands = log.read_text(encoding="utf-8")
     assert result.returncode != 0
-    assert "cron resume bbb222" in commands and "cron pause bbb222" in commands
-    assert "cron pause aaa111" in commands and "cron resume aaa111" in commands
+    assert commands.count("-p orchestrator cron status") >= 5
+    assert "cron pause aaa111" not in commands and "cron resume aaa111" not in commands
+    restored_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
+    assert restored_legacy == original_legacy
 
 
-def test_installer_restores_duplicate_current_jobs_when_pause_fails(tmp_path):
+def test_installer_restores_duplicate_current_jobs_when_pause_provider_sync_fails(tmp_path):
     home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "ccc333", "ttf-demo-transition-engine")
+    add_cron_job(home, "ddd444", "ttf-demo-transition-engine")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    originals = {
+        job["id"]: job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+    }
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
@@ -2671,12 +3052,20 @@ def test_installer_restores_duplicate_current_jobs_when_pause_fails(tmp_path):
 printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
 if [ "$*" = "-p orchestrator cron list --all" ]; then
   printf '%s\n' \
-    '  aaa111 [active]' '    Name:      demo-graph-governor' \
     '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
     '  ccc333 [active]' '    Name:      ttf-demo-transition-engine' \
     '  ddd444 [active]' '    Name:      ttf-demo-transition-engine'
 fi
-[ "$*" = "-p orchestrator cron pause ddd444" ] && exit 1
+if [ "$*" = "-p orchestrator cron status" ] && [ ! -f "$HERMES_TEST_FAILED" ] && \
+   python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+raise SystemExit(not any(job.get("id") == "ddd444" and job.get("state") == "paused" for job in jobs))
+PY
+then
+  : > "$HERMES_TEST_FAILED"
+  exit 1
+fi
 exit 0
 """,
         encoding="utf-8",
@@ -2694,17 +3083,180 @@ exit 0
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "HERMES_HOME": str(home),
             "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_FAILED": str(tmp_path / "failed"),
         },
     )
     commands = log.read_text(encoding="utf-8")
     assert result.returncode != 0
-    assert "cron pause ccc333" in commands and "cron pause ddd444" in commands
-    assert "cron resume ccc333" in commands and "cron resume ddd444" in commands
-    assert "cron pause aaa111" not in commands
+    assert commands.count("-p orchestrator cron status") >= 3
+    assert "cron pause ccc333" not in commands and "cron resume ccc333" not in commands
+    assert "cron pause ddd444" not in commands and "cron resume ddd444" not in commands
+    restored = {
+        job["id"]: job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+    }
+    assert restored == originals
 
 
-def test_installer_restores_jobs_when_a_legacy_pause_fails(tmp_path):
+@pytest.mark.parametrize(
+    ("target_id", "target_name", "extra_args"),
+    [
+        ("aaa111", "demo-graph-governor", ["--replace-legacy"]),
+        ("ccc333", "ttf-demo-transition-engine", []),
+    ],
+)
+@pytest.mark.parametrize("outcome", ["completed", "error"])
+def test_installer_preserves_managed_terminal_progress_while_parked(
+    tmp_path, target_id, target_name, extra_args, outcome
+):
     home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(
+        home,
+        target_id,
+        target_name,
+        repeat={"times": 3 if outcome == "completed" else None, "completed": 2},
+        next_run_at="due-run",
+        last_status="running",
+    )
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    completed = tmp_path / "completed"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  if [ -f "$HERMES_TEST_COMPLETED" ]; then
+    printf '%s\n' \
+      '  bbb222 [paused]' '    Name:      ttf-demo-transition-engine' \
+      "  $HERMES_TEST_TARGET [$HERMES_TEST_OUTCOME]" "    Name:      $HERMES_TEST_TARGET_NAME"
+  else
+    printf '%s\n' \
+      '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
+      "  $HERMES_TEST_TARGET [active]" "    Name:      $HERMES_TEST_TARGET_NAME"
+  fi
+fi
+if [ "$*" = "-p orchestrator cron status" ] && [ ! -f "$HERMES_TEST_COMPLETED" ]; then
+  python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_TARGET" \
+    "$HERMES_TEST_COMPLETED" "$HERMES_TEST_OUTCOME" <<'PY'
+import json, sys
+from pathlib import Path
+path, target, completed, outcome = sys.argv[1:]
+payload = json.load(open(path, encoding="utf-8"))
+job = next(job for job in payload["jobs"] if job["id"] == target)
+if job["enabled"] is not False or job["state"] != "paused":
+    raise SystemExit(0)
+if outcome == "completed":
+    job.update({
+        "repeat": {"times": 3, "completed": 3},
+        "enabled": False,
+        "state": "completed",
+        "next_run_at": None,
+        "last_status": "ok",
+        "last_run_at": "completed-while-parked",
+        "last_error": None,
+    })
+else:
+    job.update({
+        "repeat": {"times": None, "completed": 3},
+        "enabled": False,
+        "state": "error",
+        "next_run_at": None,
+        "last_status": "error",
+        "last_run_at": "failed-while-parked",
+        "last_error": "failed to compute next run",
+    })
+json.dump(payload, open(path, "w", encoding="utf-8"))
+Path(completed).touch()
+PY
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", *extra_args, "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_TARGET": target_id,
+            "HERMES_TEST_TARGET_NAME": target_name,
+            "HERMES_TEST_COMPLETED": str(completed),
+            "HERMES_TEST_OUTCOME": outcome,
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert completed.is_file()
+    assert f"cron resume {target_id}" not in commands
+    restored_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    assert restored_target["schedule"] == original_target["schedule"]
+    expected_repeat = {"times": 3 if outcome == "completed" else None, "completed": 3}
+    assert restored_target["repeat"] == expected_repeat
+    assert restored_target["enabled"] is (outcome == "error")
+    assert restored_target["state"] == outcome
+    assert restored_target["next_run_at"] is None
+    assert restored_target["last_status"] == ("ok" if outcome == "completed" else "error")
+    assert restored_target["last_run_at"] == (
+        "completed-while-parked" if outcome == "completed" else "failed-while-parked"
+    )
+
+
+@pytest.mark.parametrize(
+    ("progress_mode", "completed", "expected_enabled", "expected_state", "expected_next"),
+    [
+        ("installer-only", 2, True, "scheduled", "old-next-run"),
+        ("resume-gap", 3, True, "scheduled", "new-next-run"),
+        ("run", 3, True, "scheduled", "new-next-run"),
+        ("next-only", 2, True, "scheduled", "new-next-run"),
+        ("exhausted", 7, False, "completed", None),
+    ],
+)
+def test_installer_restores_jobs_when_post_activation_convergence_fails(
+    tmp_path, progress_mode, completed, expected_enabled, expected_state, expected_next
+):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(
+        home,
+        "bbb222",
+        "ttf-demo-transition-engine",
+        monitor_url="https://example.test/old-monitor",
+        provider_snapshot="old-provider",
+        model_snapshot="old-model",
+        skill="legacy-skill",
+        next_run_at="old-next-run",
+        last_status="running",
+        fire_claim={"at": "old-claim", "by": "runner"},
+    )
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+    payload["jobs"][0]["name"] = None
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+    original_job = payload["jobs"][0]
     scripts = home / "profiles" / "orchestrator" / "scripts"
     scripts.mkdir(parents=True)
     old_wrapper = scripts / "ttf-demo-transition-engine.py"
@@ -2719,12 +3271,85 @@ def test_installer_restores_jobs_when_a_legacy_pause_fails(tmp_path):
         """#!/bin/sh
 printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
 if [ "$*" = "-p orchestrator cron list --all" ]; then
-  printf '%s\n' \
-    '  aaa111 [active]' '    Name:      demo-graph-governor' \
-    '  aaa222 [active]' '    Name:      ttf-demo-graph-governor' \
-    '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+  if [ -f "$HERMES_TEST_RESUMED" ]; then
+    printf '%s\n' \
+      '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
+      '  ddd444 [active]' '    Name:      ttf-demo-transition-engine'
+  else
+    printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+  fi
 fi
-[ "$*" = "-p orchestrator cron pause aaa111" ] && exit 1
+case "$*" in
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_PROGRESS" <<'PY'
+import json, sys
+path = sys.argv[1]
+mode = sys.argv[2]
+payload = json.load(open(path, encoding="utf-8"))
+job = payload["jobs"][0]
+job.update({
+    "schedule": {"kind": "interval", "minutes": 1, "display": "every 1m"},
+    "schedule_display": "every 1m",
+    "script": "ttf-demo-transition-engine.py",
+    "no_agent": True,
+    "repeat": {"times": None, "completed": 2},
+    "monitor_url": None,
+    "provider_snapshot": None,
+    "model_snapshot": None,
+    "skills": ["legacy-skill"],
+})
+payload["jobs"].append({"id": "concurrent", "name": "unrelated"})
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    ;;
+esac
+if [ "$*" = "-p orchestrator cron status" ]; then
+  python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_PROGRESS" \
+    "$HERMES_TEST_RESUMED" "$HERMES_TEST_FAILED" <<'PY'
+import json, sys
+from pathlib import Path
+path, mode, resumed_name, failed_name = sys.argv[1:]
+resumed, failed = Path(resumed_name), Path(failed_name)
+payload = json.load(open(path, encoding="utf-8"))
+job = payload["jobs"][0]
+if (
+    not resumed.exists()
+    and job.get("state") == "scheduled"
+    and job.get("script") == "ttf-demo-transition-engine.py"
+):
+    resumed.touch()
+    if mode == "resume-gap":
+        job.update({
+            "repeat": {"times": None, "completed": 3}, "last_status": "ok",
+            "last_run_at": "new-completion", "last_error": None,
+            "fire_claim": None, "next_run_at": "new-next-run",
+        })
+    competitor = dict(job)
+    competitor.update({"id": "ddd444", "name": "ttf-demo-transition-engine"})
+    payload["jobs"].append(competitor)
+elif resumed.exists() and not failed.exists():
+    competitor = next(
+        (candidate for candidate in payload["jobs"] if candidate.get("id") == "ddd444"),
+        None,
+    )
+    if competitor is not None and competitor.get("state") == "paused":
+        if mode == "run":
+            job.update({"repeat": {"times": None, "completed": 3}, "last_status": "ok",
+                        "last_run_at": "new-completion", "last_error": None,
+                        "fire_claim": None, "next_run_at": "new-next-run"})
+        elif mode == "next-only":
+            job["next_run_at"] = "new-next-run"
+        elif mode == "exhausted":
+            job.update({"repeat": {"times": None, "completed": 7}, "last_status": "ok",
+                        "last_run_at": "new-completion", "last_error": None,
+                        "fire_claim": None, "next_run_at": "new-next-run"})
+        failed.touch()
+        json.dump(payload, open(path, "w", encoding="utf-8"))
+        raise SystemExit(7)
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+  [ "$?" -eq 0 ] || exit 1
+fi
 exit 0
 """,
         encoding="utf-8",
@@ -2735,6 +3360,10 @@ exit 0
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "HERMES_HOME": str(home),
         "HERMES_TEST_LOG": str(log),
+        "HERMES_TEST_JOBS": str(jobs_path),
+        "HERMES_TEST_PROGRESS": progress_mode,
+        "HERMES_TEST_RESUMED": str(tmp_path / "resumed"),
+        "HERMES_TEST_FAILED": str(tmp_path / "failed"),
     }
     result = subprocess.run(
         [
@@ -2747,12 +3376,162 @@ exit 0
     )
     commands = log.read_text(encoding="utf-8")
     assert result.returncode != 0
-    assert "cron pause aaa111" in commands and "cron pause aaa222" in commands
-    assert "cron resume aaa111" in commands and "cron resume aaa222" in commands
-    assert "cron pause bbb222" in commands and "cron resume bbb222" in commands
+    assert (tmp_path / "resumed").is_file()
+    assert (tmp_path / "failed").is_file()
+    assert commands.count("-p orchestrator cron status") >= 3
+    assert "cron resume bbb222" not in commands
+    assert "cron resume ddd444" not in commands
+    restored_jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+    restored = restored_jobs[0]
+    assert restored["schedule"] == original_job["schedule"]
+    assert restored["schedule_display"] == original_job["schedule_display"]
+    assert restored["script"] == original_job["script"]
+    assert restored["no_agent"] == original_job["no_agent"]
+    assert restored["monitor_url"] == original_job["monitor_url"]
+    assert restored["provider_snapshot"] == original_job["provider_snapshot"]
+    assert restored["model_snapshot"] == original_job["model_snapshot"]
+    assert restored["name"] is None
+    assert restored["skill"] == original_job["skill"] and "skills" not in restored
+    assert restored["repeat"] == {"times": 7, "completed": completed}
+    assert restored["next_run_at"] == expected_next
+    assert restored["enabled"] is expected_enabled and restored["state"] == expected_state
+    if progress_mode in {"installer-only", "next-only"}:
+        assert restored["last_status"] == "running"
+        assert restored["fire_claim"] == {"at": "old-claim", "by": "runner"}
+    else:
+        assert restored["last_status"] == "ok" and restored["last_run_at"] == "new-completion"
+        assert restored["fire_claim"] is None
+    assert restored_jobs[1] == {"id": "concurrent", "name": "unrelated"}
+    assert commands.count("-p orchestrator cron status") >= 3
     assert old_wrapper.read_text(encoding="utf-8") == "late old wrapper\n"
     assert old_core.read_text(encoding="utf-8") == "late old core\n"
-    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == [], result.stderr
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        {"enabled": True, "state": "error"},
+        {"enabled": False, "state": "completed"},
+        {"enabled": False, "state": "scheduled"},
+        {
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "old-pause",
+            "paused_reason": "owner",
+            "repeat": {"times": 7, "completed": 7},
+        },
+    ],
+)
+def test_installer_parks_every_existing_job_shape_before_edit(tmp_path, original):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine", **original)
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_job = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    observed = tmp_path / "observed"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+case "$*" in
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_OBSERVED" <<'PY'
+import json, sys
+job = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"][0]
+assert job["enabled"] is False and job["state"] == "paused" and job.get("paused_at")
+open(sys.argv[2], "w", encoding="utf-8").write("parked")
+PY
+    exit 1 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_OBSERVED": str(observed),
+        },
+    )
+
+    assert result.returncode != 0
+    assert observed.read_text(encoding="utf-8") == "parked"
+    assert json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"] == [original_job]
+
+
+def test_installer_final_restore_runs_after_provider_notification_failure(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    counter = tmp_path / "counter"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+case "$*" in
+  "-p orchestrator cron status")
+    count=0; [ ! -f "$HERMES_TEST_COUNTER" ] || count=$(cat "$HERMES_TEST_COUNTER")
+    count=$((count + 1)); printf '%s' "$count" > "$HERMES_TEST_COUNTER"
+    if [ "$count" -eq 3 ]; then
+      exit 1
+    fi ;;
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+payload["jobs"][0]["script"] = "replacement.py"
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    exit 1 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_COUNTER": str(counter),
+        },
+    )
+
+    restored = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    assert result.returncode != 0
+    assert restored == original
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    assert len(list(scripts.glob(".ttf-demo-engine-rollback.*"))) == 1
 
 
 def test_local_install_restores_previous_plugin_when_enable_fails(tmp_path):
@@ -3040,6 +3819,7 @@ def test_local_install_distinguishes_shared_and_profile_homes(tmp_path):
 
 def test_autopilot_installer_preserves_shared_home_nested_under_profiles(tmp_path):
     home, _, _ = make_board(tmp_path / "srv" / "profiles")
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine", profile="default")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     hermes = fake_bin / "hermes"
