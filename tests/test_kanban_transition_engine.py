@@ -610,7 +610,6 @@ def test_terminal_approval_that_is_also_review_descendant_is_refreshed(tmp_path)
         ],
         [
             ("t_prod", "t_review"),
-            ("t_prod", "t_security"),
             ("t_review", "t_security"),
             ("t_security", "t_release"),
         ],
@@ -620,6 +619,9 @@ def test_terminal_approval_that_is_also_review_descendant_is_refreshed(tmp_path)
     result = ENGINE["reconcile"]("demo", str(home), False)
 
     with sqlite3.connect(db_path) as conn:
+        remediation = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review-%'"
+        ).fetchone()[0]
         peer = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key LIKE "
             "'ttf-rereview-t_review-peer-t_security-%'"
@@ -631,8 +633,183 @@ def test_terminal_approval_that_is_also_review_descendant_is_refreshed(tmp_path)
             (peer,),
         ).fetchone()[0] == 1
         assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (remediation, peer),
+        ).fetchone()[0] == 1
+        assert conn.execute(
             "SELECT COUNT(*) FROM task_links WHERE parent_id='t_security' AND child_id='t_release'"
         ).fetchone()[0] == 0
+
+
+def test_archived_producer_is_a_completed_handoff(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "archived", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        remediation, rereview = transition_rows(conn, "t_review")
+        assert result == [f"remediated t_review -> {remediation[0]} -> {rereview[0]}"]
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_prod'").fetchone()[0] == "archived"
+
+
+def test_mixed_terminal_descendant_path_refreshes_every_approval(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_privacy", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "ready", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_review", "t_security"),
+            ("t_security", "t_build"),
+            ("t_build", "t_privacy"),
+            ("t_privacy", "t_release"),
+        ],
+        [("t_review", VERDICT), ("t_security", APPROVED), ("t_privacy", APPROVED)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+
+    with sqlite3.connect(db_path) as conn:
+        remediation = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review-%'"
+        ).fetchone()[0]
+        follow_up = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()[0]
+        peers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-%'"
+            )
+        }
+        gate = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_review-replay-%'"
+        ).fetchone()[0]
+        parents = {
+            row[0]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id='t_release'"
+            )
+        }
+        assert result == [f"remediated t_review -> {remediation} -> {follow_up}"]
+        assert len(peers) == 2
+        assert parents == {follow_up, gate, *peers}
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_release'").fetchone()[0] == "todo"
+        assert conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone() is None
+    assert ENGINE["reconcile"]("demo", str(home), False, "ops-owner") == []
+
+
+def test_terminal_descendant_diamond_refreshes_every_approval(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_privacy", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_final_review", "done", "release-reviewer", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "ready", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_review", "t_security"),
+            ("t_review", "t_privacy"),
+            ("t_security", "t_final_review"),
+            ("t_privacy", "t_final_review"),
+            ("t_final_review", "t_release"),
+        ],
+        [
+            ("t_review", VERDICT),
+            ("t_security", APPROVED),
+            ("t_privacy", APPROVED),
+            ("t_final_review", APPROVED),
+        ],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        follow_up = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()[0]
+        peers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-%'"
+            )
+        }
+        parents = {
+            row[0]
+            for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id='t_release'")
+        }
+        assert len(result) == 1 and result[0].startswith("remediated t_review -> ")
+        assert len(peers) == 3
+        assert parents == {follow_up, *peers}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_review-replay-%'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone() is None
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_terminal_descendant_frontier_aggregation_is_bounded(tmp_path):
+    _, db_path, workspace = make_board(tmp_path)
+    tasks = [("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None)]
+    comments = []
+    layers = []
+    for layer in range(20):
+        nodes = (f"t_layer{layer}a", f"t_layer{layer}b")
+        layers.append(nodes)
+        tasks.extend(
+            (node, "done", "reviewer", "worktree", str(workspace), None, None, None, None)
+            for node in nodes
+        )
+        comments.extend((node, APPROVED) for node in nodes)
+    tasks.append(("t_live", "blocked", "release", "scratch", None, None, None, "needs_input", None))
+    links = [("t_review", node) for node in layers[0]]
+    for parents, children in zip(layers, layers[1:]):
+        links.extend((parent, child) for parent in parents for child in children)
+    links.extend((parent, "t_live") for parent in layers[-1])
+    add_tasks(db_path, tasks, links, comments)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        frontiers = ENGINE["terminal_descendant_frontiers"](conn, "t_review")
+
+    assert len(frontiers) == 2
+    assert {approval for frontier in frontiers for approval in frontier.approval_ids} == {
+        node for layer in layers for node in layer
+    }
+    assert all(not frontier.needs_replay for frontier in frontiers)
 
 
 def test_stale_refresh_gates_terminal_descendant_frontiers(tmp_path, monkeypatch):
@@ -643,10 +820,12 @@ def test_stale_refresh_gates_terminal_descendant_frontiers(tmp_path, monkeypatch
             ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
             ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
             ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_stale_security", "done", "security", "worktree", str(workspace), None, None, None, None),
             ("t_approval", "done", "privacy", "worktree", str(workspace), None, None, None, None),
             ("t_build", "done", "builder", "scratch", None, None, None, None, None),
             ("t_terminal", "archived", "builder", "scratch", None, None, None, None, None),
             ("t_review_live", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+            ("t_stale_live", "blocked", "release", "scratch", None, None, None, "needs_input", None),
             ("t_replay_live", "blocked", "release", "scratch", None, None, None, "needs_input", None),
         ],
         [
@@ -654,6 +833,8 @@ def test_stale_refresh_gates_terminal_descendant_frontiers(tmp_path, monkeypatch
             ("t_prod", "t_security"),
             ("t_review", "t_security"),
             ("t_security", "t_review_live"),
+            ("t_review", "t_stale_security"),
+            ("t_stale_security", "t_stale_live"),
             ("t_prod", "t_approval"),
             ("t_approval", "t_build"),
             ("t_build", "t_terminal"),
@@ -663,6 +844,7 @@ def test_stale_refresh_gates_terminal_descendant_frontiers(tmp_path, monkeypatch
         [
             ("t_review", VERDICT),
             ("t_security", APPROVED.replace("abc1234", "def5678")),
+            ("t_stale_security", APPROVED),
             ("t_approval", APPROVED.replace("abc1234", "def5678")),
         ],
     )
@@ -678,9 +860,17 @@ def test_stale_refresh_gates_terminal_descendant_frontiers(tmp_path, monkeypatch
         replay_gate = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_review-replay-%'"
         ).fetchone()[0]
+        stale_peer = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-refresh-review-t_review-peer-t_stale_security-%'"
+        ).fetchone()[0]
         assert result == [f"refreshed stale review t_review -> {refresh} at def5678"]
         assert conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-refresh-review-t_review-peer-t_security-%'"
         ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_review_live'",
@@ -690,16 +880,79 @@ def test_stale_refresh_gates_terminal_descendant_frontiers(tmp_path, monkeypatch
             "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_replay_live'",
             (replay_gate,),
         ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_stale_live'",
+            (stale_peer,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_stale_security' "
+            "AND child_id='t_stale_live'"
+        ).fetchone()[0] == 0
         conn.execute(
             "UPDATE tasks SET status='ready', block_kind=NULL "
-            "WHERE id IN ('t_review_live', 't_replay_live')"
+            "WHERE id IN ('t_review_live', 't_stale_live', 't_replay_live')"
         )
-        for child in ("t_review_live", "t_replay_live"):
+        for child in ("t_review_live", "t_stale_live", "t_replay_live"):
             assert conn.execute(
                 "SELECT COUNT(*) FROM task_links l JOIN tasks p ON p.id=l.parent_id "
                 "WHERE l.child_id=? AND p.status NOT IN ('done', 'archived')",
                 (child,),
             ).fetchone()[0] >= 1
+
+
+def test_stale_terminal_descendant_diamond_refreshes_every_approval(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_privacy", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_final_review", "done", "release-reviewer", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_review", "t_security"),
+            ("t_review", "t_privacy"),
+            ("t_security", "t_final_review"),
+            ("t_privacy", "t_final_review"),
+            ("t_final_review", "t_release"),
+        ],
+        [
+            ("t_review", VERDICT),
+            ("t_security", APPROVED),
+            ("t_privacy", APPROVED),
+            ("t_final_review", APPROVED),
+        ],
+    )
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        refresh = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()[0]
+        peers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-peer-%'"
+            )
+        }
+        parents = {
+            row[0]
+            for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id='t_release'")
+        }
+        assert result == [f"refreshed stale review t_review -> {refresh} at def5678"]
+        assert len(peers) == 3
+        assert parents == {refresh, *peers}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_final_review' AND child_id='t_release'"
+        ).fetchone()[0] == 0
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
 
 
 @pytest.mark.parametrize("sibling_status", ["done", "archived"])
