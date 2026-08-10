@@ -1041,6 +1041,7 @@ exit 0
     assert "'--owner-profile', 'orchestrator'" in wrapper_text
     assert f"os.environ['HERMES_KANBAN_DB'] = '{db_path}'" in wrapper_text
     assert "HERMES_KANBAN_TASK" in wrapper_text and "os.environ.pop" in wrapper_text
+    assert list(wrapper.parent.glob(".ttf-demo-engine-rollback.*")) == []
 
 
 def test_installer_keeps_engine_copies_isolated_per_board(tmp_path):
@@ -1095,6 +1096,12 @@ exit 0
 
 def test_installer_leaves_legacy_active_when_replacement_fails(tmp_path):
     home, _, _ = make_board(tmp_path)
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    scripts.mkdir(parents=True)
+    old_wrapper = scripts / "ttf-demo-transition-engine.py"
+    old_core = scripts / "ttf-demo-transition-engine-core.py"
+    old_wrapper.write_text("old wrapper\n", encoding="utf-8")
+    old_core.write_text("old core\n", encoding="utf-8")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
@@ -1131,6 +1138,9 @@ exit 0
     commands = log.read_text(encoding="utf-8")
     assert result.returncode != 0
     assert "cron pause aaa111" not in commands
+    assert old_wrapper.read_text(encoding="utf-8") == "old wrapper\n"
+    assert old_core.read_text(encoding="utf-8") == "old core\n"
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
 
 
 def test_installer_rolls_back_replacement_when_activation_cannot_be_verified(tmp_path):
@@ -1170,6 +1180,10 @@ exit 0
     assert result.returncode != 0
     assert "cron resume bbb222" in commands and "cron pause bbb222" in commands
     assert "cron pause aaa111" not in commands
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    assert not (scripts / "ttf-demo-transition-engine.py").exists()
+    assert not (scripts / "ttf-demo-transition-engine-core.py").exists()
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
 
 
 def test_installer_rolls_back_replacement_when_verification_list_fails(tmp_path):
@@ -1262,6 +1276,12 @@ exit 0
 
 def test_installer_restores_jobs_when_a_legacy_pause_fails(tmp_path):
     home, _, _ = make_board(tmp_path)
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    scripts.mkdir(parents=True)
+    old_wrapper = scripts / "ttf-demo-transition-engine.py"
+    old_core = scripts / "ttf-demo-transition-engine-core.py"
+    old_wrapper.write_text("late old wrapper\n", encoding="utf-8")
+    old_core.write_text("late old core\n", encoding="utf-8")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     log = tmp_path / "hermes.log"
@@ -1301,6 +1321,9 @@ exit 0
     assert "cron pause aaa111" in commands and "cron pause aaa222" in commands
     assert "cron resume aaa111" in commands and "cron resume aaa222" in commands
     assert "cron pause bbb222" not in commands
+    assert old_wrapper.read_text(encoding="utf-8") == "late old wrapper\n"
+    assert old_core.read_text(encoding="utf-8") == "late old core\n"
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
 
 
 def test_local_install_restores_previous_plugin_when_enable_fails(tmp_path):

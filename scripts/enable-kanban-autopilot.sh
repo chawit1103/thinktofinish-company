@@ -174,15 +174,20 @@ if [[ "$TARGET" != "$PROFILE_HOME/"* ]]; then
   echo "Profile scripts directory resolves outside profile home: $TARGET" >&2
   exit 2
 fi
-python3 - "$TARGET/$ENGINE" "$TARGET/$ENGINE_CORE" "$ROOT/scripts/kanban-transition-engine.py" \
-  "$BOARD" "$KANBAN_HOME" "$PINNED_DB" "$PROFILE" <<'PY'
+ENGINE_PATH="$TARGET/$ENGINE"
+ENGINE_CORE_PATH="$TARGET/$ENGINE_CORE"
+ROLLBACK_DIR="$(mktemp -d "$TARGET/.ttf-${BOARD}-engine-rollback.XXXXXX")"
+if ! python3 - "$ENGINE_PATH" "$ENGINE_CORE_PATH" "$ROOT/scripts/kanban-transition-engine.py" \
+  "$BOARD" "$KANBAN_HOME" "$PINNED_DB" "$PROFILE" "$ROLLBACK_DIR" <<'PY'
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 wrapper, core, source = map(Path, sys.argv[1:4])
 board, kanban_home, kanban_db, owner_profile = sys.argv[4:8]
+rollback = Path(sys.argv[8])
 
 def atomic_write(path: Path, data: bytes) -> None:
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
@@ -196,16 +201,69 @@ def atomic_write(path: Path, data: bytes) -> None:
     finally:
         Path(temporary).unlink(missing_ok=True)
 
-atomic_write(core, source.read_bytes())
-wrapper_source = (
-    "#!/usr/bin/env python3\nimport os, subprocess, sys\n"
-    "for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_CLAIM_LOCK', 'HERMES_KANBAN_WORKSPACE'):\n    os.environ.pop(key, None)\n"
-    f"os.environ['HERMES_KANBAN_HOME'] = {kanban_home!r}\n"
-    f"os.environ['HERMES_KANBAN_DB'] = {kanban_db!r}\n"
-    f"raise SystemExit(subprocess.run([sys.executable, {str(core)!r}, '--board', {board!r}, '--home', {kanban_home!r}, '--owner-profile', {owner_profile!r}]).returncode)\n"
-)
-atomic_write(wrapper, wrapper_source.encode())
+targets = ((core, "core"), (wrapper, "wrapper"))
+existed = {name: os.path.lexists(path) for path, name in targets}
+published = False
+try:
+    for path, name in targets:
+        if existed[name]:
+            shutil.copy2(path, rollback / name, follow_symlinks=False)
+            (rollback / f"{name}.existed").touch()
+    wrapper_source = (
+        "#!/usr/bin/env python3\nimport os, subprocess, sys\n"
+        "for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_CLAIM_LOCK', 'HERMES_KANBAN_WORKSPACE'):\n    os.environ.pop(key, None)\n"
+        f"os.environ['HERMES_KANBAN_HOME'] = {kanban_home!r}\n"
+        f"os.environ['HERMES_KANBAN_DB'] = {kanban_db!r}\n"
+        f"raise SystemExit(subprocess.run([sys.executable, {str(core)!r}, '--board', {board!r}, '--home', {kanban_home!r}, '--owner-profile', {owner_profile!r}]).returncode)\n"
+    )
+    published = True
+    atomic_write(core, source.read_bytes())
+    atomic_write(wrapper, wrapper_source.encode())
+except Exception:
+    if published:
+        for path, name in targets:
+            backup = rollback / name
+            if existed[name] and os.path.lexists(backup):
+                os.replace(backup, path)
+            elif not existed[name]:
+                path.unlink(missing_ok=True)
+    shutil.rmtree(rollback, ignore_errors=True)
+    raise
 PY
+then
+  echo "Could not stage the board-specific transition engine; previous files were preserved." >&2
+  exit 1
+fi
+
+ENGINE_FILES_COMMITTED=0
+finish_engine_files() {
+  local status=$?
+  set +e
+  if ! python3 - "$ENGINE_PATH" "$ENGINE_CORE_PATH" "$ROLLBACK_DIR" "$ENGINE_FILES_COMMITTED" <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+wrapper, core, rollback = map(Path, sys.argv[1:4])
+committed = sys.argv[4] == "1"
+if not committed:
+    for path, name in ((core, "core"), (wrapper, "wrapper")):
+        backup = rollback / name
+        if (rollback / f"{name}.existed").exists():
+            os.replace(backup, path)
+        else:
+            path.unlink(missing_ok=True)
+shutil.rmtree(rollback, ignore_errors=committed)
+PY
+  then
+    echo "Failed to restore the previous transition engine files." >&2
+    status=1
+  fi
+  trap - EXIT
+  exit "$status"
+}
+trap finish_engine_files EXIT
 
 JOB_INFO="$(cron_jobs "$JOB_NAME")"
 CURRENT_WAS_ACTIVE=0
@@ -290,4 +348,5 @@ for ((i=0; i<${#LEGACY_IDS[@]}; i++)); do
   exit 1
 done
 
+ENGINE_FILES_COMMITTED=1
 echo "Transition engine enabled for board: $BOARD (profile: $PROFILE)"

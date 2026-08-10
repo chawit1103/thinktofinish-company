@@ -251,7 +251,7 @@ When upgrading a board that still has a legacy handoff/governor cron, first migr
 ./scripts/enable-kanban-autopilot.sh --profile orchestrator --replace-legacy mini-hrms
 ```
 
-The installer scans every Hermes profile, pauses each matching active legacy job, and converges duplicate/current jobs to one infinite no-agent cron. Each board gets its own atomically replaced engine copy. Re-run the same command for each managed board after updating this plugin so that board's installed engine is refreshed.
+The installer scans every Hermes profile, pauses each matching active legacy job, and converges duplicate/current jobs to one infinite no-agent cron. Each board gets its own atomically replaced engine copy, and a failed cron takeover restores the previous copy. Re-run the same command for each managed board after updating this plugin so that board's installed engine is refreshed.
 
 ---
 
