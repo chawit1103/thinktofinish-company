@@ -106,6 +106,23 @@ def rereview_body(review_id: str, producer_id: str, remediation_id: str, verdict
     )
 
 
+def peer_rereview_body(
+    sibling_id: str,
+    producer_id: str,
+    remediation_id: str,
+    verdict: ReviewVerdict,
+) -> str:
+    return (
+        f"Read-only refresh of prior independent approval `{sibling_id}` for original producer `{producer_id}`. "
+        f"That approval covered baseline `{verdict.reviewed_commit}`, which remediation task `{remediation_id}` may have "
+        "invalidated.\n\n"
+        "Resolve the completed remediation handoff commit from its evidence and checkout HEAD; review that new commit, not "
+        "the prior approved baseline. Revalidate the prior review's complete contract and every downstream condition it "
+        "gates. Return one structured ttf_review verdict whose reviewed_commit is the remediation commit; do not repair "
+        "the implementation yourself."
+    )
+
+
 def gate_body(review_id: str, verdict: ReviewVerdict) -> str:
     return (
         f"Autonomous remediation stopped after {MAX_REMEDIATION_GENERATIONS} generations for review `{review_id}` at "
@@ -248,6 +265,101 @@ def historical_rejection(conn: sqlite3.Connection, review_id: str) -> bool:
             "SELECT author, body FROM task_comments WHERE task_id=? ORDER BY id DESC", (review_id,)
         )
     )
+
+
+def task_ancestors(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    return {
+        row[0]
+        for row in conn.execute(
+            "WITH RECURSIVE ancestors(id) AS ("
+            "SELECT parent_id FROM task_links WHERE child_id=? UNION "
+            "SELECT l.parent_id FROM task_links l JOIN ancestors a ON l.child_id=a.id) "
+            "SELECT id FROM ancestors",
+            (task_id,),
+        )
+    }
+
+
+def task_descendants(conn: sqlite3.Connection, task_id: str) -> set[str]:
+    return {
+        row[0]
+        for row in conn.execute(
+            "WITH RECURSIVE descendants(id) AS ("
+            "SELECT child_id FROM task_links WHERE parent_id=? UNION "
+            "SELECT l.child_id FROM task_links l JOIN descendants d ON l.parent_id=d.id) "
+            "SELECT id FROM descendants",
+            (task_id,),
+        )
+    }
+
+
+def approval_side_edges(
+    conn: sqlite3.Connection,
+    review: sqlite3.Row,
+    producer: sqlite3.Row,
+) -> tuple[tuple[sqlite3.Row, ReviewVerdict, tuple[str, ...]], ...]:
+    ancestors = task_ancestors(conn, review["id"])
+    review_descendants = task_descendants(conn, review["id"])
+    excluded = review_descendants | {review["id"]}
+    candidates: dict[str, tuple[sqlite3.Row, ReviewVerdict]] = {}
+    for ancestor_id in sorted(ancestors):
+        if ancestor_id == producer["id"] or ancestor_id in excluded:
+            continue
+        ancestor = conn.execute("SELECT * FROM tasks WHERE id=?", (ancestor_id,)).fetchone()
+        if not ancestor or ancestor["status"] not in {"done", "archived"}:
+            continue
+        if verdict := historical_verdict(conn, ancestor_id):
+            candidates[ancestor_id] = (ancestor, verdict)
+    frontier = [producer["id"], *sorted(ancestors)]
+    expanded: set[str] = set()
+    while frontier:
+        parent_id = frontier.pop()
+        if parent_id in expanded:
+            continue
+        expanded.add(parent_id)
+        children = conn.execute(
+            "SELECT c.* FROM task_links l JOIN tasks c ON c.id=l.child_id "
+            "WHERE l.parent_id=? ORDER BY c.id",
+            (parent_id,),
+        ).fetchall()
+        for child in children:
+            if child["id"] in excluded or child["status"] not in {"done", "archived"}:
+                continue
+            child_verdict = historical_verdict(conn, child["id"])
+            if not child_verdict:
+                continue
+            candidates[child["id"]] = (child, child_verdict)
+            frontier.append(child["id"])
+    approvals = []
+    for sibling, verdict in (candidates[task_id] for task_id in sorted(candidates)):
+        side_children = tuple(
+            row["id"]
+            for row in conn.execute(
+                "SELECT c.id, c.idempotency_key FROM task_links l JOIN tasks c ON c.id=l.child_id "
+                "WHERE l.parent_id=? AND c.status NOT IN ('done', 'archived') ORDER BY c.id",
+                (sibling["id"],),
+            )
+            if row["id"] != review["id"]
+            and row["id"] not in ancestors
+            and not (row["idempotency_key"] or "").startswith(
+                ("ttf-remediation-", "ttf-rereview-", "ttf-review-gate-", "ttf-refresh-review-")
+            )
+        )
+        if verdict.decision != "approved":
+            if sibling["status"] == "archived" and not side_children:
+                continue
+            raise ValueError(
+                f"terminal sibling review {sibling['id']} gating live work has a non-approved verdict"
+            )
+        if not side_children:
+            continue
+        if not isinstance(sibling["assignee"], str) or not sibling["assignee"].strip():
+            raise ValueError(f"terminal sibling review {sibling['id']} has no assignee")
+        if sibling["tenant"] and (review["tenant"] or producer["tenant"]):
+            if sibling["tenant"] != (review["tenant"] or producer["tenant"]):
+                raise ValueError(f"tenant mismatch between {sibling['id']} and {review['id']}")
+        approvals.append((sibling, verdict, side_children))
+    return tuple(approvals)
 
 
 def git_output(task_id: str, path: Path, *args: str, input_text: str | None = None) -> str:
@@ -513,6 +625,10 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
     ).fetchall()
     if active:
         raise ValueError(f"review {review_id} already has an active or conflicting transition")
+    approval_edges = approval_side_edges(conn, review, producer)
+    regated_children = {
+        child_id for _sibling, _verdict, children in approval_edges for child_id in children
+    }
     producer_workspace = workspace(producer).removeprefix("dir:")
     candidates = conn.execute(
         "WITH candidates AS (SELECT t.*, EXISTS ("
@@ -524,34 +640,77 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
         "NOT EXISTS (SELECT 1 FROM task_links pl JOIN tasks p ON p.id=pl.parent_id "
         "WHERE pl.child_id=t.id AND p.status NOT IN ('done', 'archived')) AS parents_terminal "
         "FROM tasks t WHERE t.id!=?) "
-        "SELECT id, workspace_path, same_producer, engine_transition FROM candidates WHERE "
+        "SELECT id, status, current_run_id, claim_lock, worker_pid, workspace_kind, workspace_path, "
+        "same_producer, engine_transition FROM candidates WHERE "
         "(current_run_id IS NOT NULL OR status IN ('running', 'review') "
-        "OR (status IN ('todo', 'ready') AND parents_terminal)) "
-        "AND (engine_transition OR same_producer "
-        "OR (workspace_kind IN ('dir', 'worktree') AND workspace_path IS NOT NULL))",
+        "OR (status IN ('todo', 'ready') AND parents_terminal))",
         (producer["id"], review_id),
     ).fetchall()
     producer_root = Path(producer_workspace)
+    tentatively_skipped_children: set[str] = set()
     for candidate in candidates:
+        if candidate["id"] in regated_children:
+            if (
+                candidate["status"] in {"todo", "ready"}
+                and candidate["current_run_id"] is None
+                and candidate["claim_lock"] is None
+                and candidate["worker_pid"] is None
+            ):
+                tentatively_skipped_children.add(candidate["id"])
+                continue
+            return None
         if candidate["same_producer"]:
             return None
-        if candidate_shares_checkout(
-            candidate, producer_root, fail_closed=bool(candidate["engine_transition"])
-        ):
-            return None
+        if candidate["engine_transition"] or candidate["workspace_kind"] in {"dir", "worktree"}:
+            if candidate_shares_checkout(
+                candidate, producer_root, fail_closed=bool(candidate["engine_transition"])
+            ):
+                return None
     head = workspace_head(producer)
     reviewed_head = resolve_reviewed_commit(producer["id"], producer_root, verdict.reviewed_commit)
     digest = transition_digest(producer, review, verdict, head)
     depth, refresh_depth = transition_depths(conn, review_id)
-    downstream = tuple(
-        row[0]
-        for row in conn.execute(
-            "SELECT c.id FROM task_links l JOIN tasks c ON c.id=l.child_id "
-            "WHERE l.parent_id=? AND c.status!='archived' ORDER BY c.id",
-            (review_id,),
+    downstream_rows = conn.execute(
+        "SELECT c.id, c.status FROM task_links l JOIN tasks c ON c.id=l.child_id "
+        "WHERE l.parent_id=? AND c.status!='archived' ORDER BY c.id",
+        (review_id,),
+    ).fetchall()
+    downstream = tuple(row["id"] for row in downstream_rows)
+    peer_approvals = tuple(
+        (
+            sibling,
+            sibling_verdict,
+            side_children,
+            resolve_reviewed_commit(
+                producer["id"], producer_root, sibling_verdict.reviewed_commit
+            ),
         )
+        for sibling, sibling_verdict, side_children in approval_edges
     )
-    return review, producer, verdict, comment_marker, depth, digest, downstream, head, refresh_depth, reviewed_head
+    actual_approvals = (
+        tuple(approval for approval in peer_approvals if approval[3] != head)
+        if reviewed_head != head or depth >= MAX_REMEDIATION_GENERATIONS
+        else peer_approvals
+    )
+    actual_regated_children = {
+        child_id for _sibling, _verdict, children, _reviewed_head in actual_approvals
+        for child_id in children
+    }
+    if tentatively_skipped_children - actual_regated_children:
+        return None
+    return (
+        review,
+        producer,
+        verdict,
+        comment_marker,
+        depth,
+        digest,
+        downstream,
+        head,
+        refresh_depth,
+        reviewed_head,
+        peer_approvals,
+    )
 
 
 def append_event(conn: sqlite3.Connection, task_id: str, kind: str, payload: dict | None, now: int):
@@ -656,6 +815,25 @@ def insert_task(
     return task_id
 
 
+def rewire_children(
+    conn: sqlite3.Connection,
+    source_id: str,
+    successor_id: str,
+    downstream: tuple[str, ...],
+) -> None:
+    now = int(time.time())
+    for child in downstream:
+        conn.execute("INSERT OR IGNORE INTO task_links(parent_id, child_id) VALUES (?, ?)", (successor_id, child))
+        conn.execute(
+            "UPDATE tasks SET status='todo' WHERE id=? AND status='ready' AND current_run_id IS NULL",
+            (child,),
+        )
+        conn.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", (source_id, child))
+        append_event(conn, child, "linked", {"parent": successor_id, "child": child}, now)
+        append_event(conn, child, "unlinked", {"parent": source_id, "child": child}, now)
+        inherit_notify_subs(conn, child, (successor_id,), now)
+
+
 def rewire_and_archive(
     conn: sqlite3.Connection,
     review_id: str,
@@ -663,13 +841,8 @@ def rewire_and_archive(
     downstream: tuple[str, ...],
     digest: str,
 ) -> None:
+    rewire_children(conn, review_id, successor_id, downstream)
     now = int(time.time())
-    for child in downstream:
-        conn.execute("INSERT OR IGNORE INTO task_links(parent_id, child_id) VALUES (?, ?)", (successor_id, child))
-        conn.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", (review_id, child))
-        append_event(conn, child, "linked", {"parent": successor_id, "child": child}, now)
-        append_event(conn, child, "unlinked", {"parent": review_id, "child": child}, now)
-        inherit_notify_subs(conn, child, (successor_id,), now)
     updated = conn.execute(
         "UPDATE tasks SET status='archived', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
         "WHERE id=? AND status='blocked' AND current_run_id IS NULL",
@@ -688,9 +861,24 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
         if not plan:
             conn.rollback()
             return None
-        review, producer, verdict, _marker, depth, digest, downstream, head, refresh_depth, reviewed_head = plan
+        (
+            review,
+            producer,
+            verdict,
+            _marker,
+            depth,
+            digest,
+            downstream,
+            head,
+            refresh_depth,
+            reviewed_head,
+            peer_approvals,
+        ) = plan
         tenant = review["tenant"] or producer["tenant"]
         workspace_path = workspace(producer).removeprefix("dir:")
+        stale_peer_approvals = tuple(
+            approval for approval in peer_approvals if approval[3] != head
+        )
         if reviewed_head != head:
             if refresh_depth >= MAX_REMEDIATION_GENERATIONS:
                 gate = insert_task(
@@ -704,8 +892,13 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
                     idempotency_key=f"ttf-review-gate-{review_id}-{digest}",
                     parents=(producer["id"],),
                     block_kind="needs_input",
-                    notification_parents=(review_id,),
+                    notification_parents=(
+                        review_id,
+                        *(approval[0]["id"] for approval in stale_peer_approvals),
+                    ),
                 )
+                for sibling, _sibling_verdict, side_children, _sibling_head in stale_peer_approvals:
+                    rewire_children(conn, sibling["id"], gate, side_children)
                 rewire_and_archive(conn, review_id, gate, downstream, digest)
                 conn.commit()
                 return f"gated stale review {review_id} -> {gate} after {refresh_depth} refreshes"
@@ -720,6 +913,24 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
                 idempotency_key=f"ttf-refresh-review-{review_id}-{digest}",
                 parents=(review_id,),
             )
+            for sibling, sibling_verdict, side_children, _sibling_head in stale_peer_approvals:
+                peer_refresh = insert_task(
+                    conn,
+                    title=f"Refresh stale prior approval from {sibling['id']}",
+                    body=stale_review_body(
+                        sibling["id"], producer["id"], sibling_verdict, head
+                    ),
+                    assignee=sibling["assignee"],
+                    status="ready",
+                    workspace_path=workspace_path,
+                    tenant=tenant,
+                    idempotency_key=(
+                        f"ttf-refresh-review-{review_id}-peer-{sibling['id']}-{digest}"
+                    ),
+                    parents=(review_id,),
+                    notification_parents=(sibling["id"],),
+                )
+                rewire_children(conn, sibling["id"], peer_refresh, side_children)
             rewire_and_archive(conn, review_id, refresh, downstream, digest)
             conn.commit()
             return f"refreshed stale review {review_id} -> {refresh} at {head}"
@@ -735,8 +946,13 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
                 idempotency_key=f"ttf-review-gate-{review_id}-{digest}",
                 parents=(producer["id"],),
                 block_kind="needs_input",
-                notification_parents=(review_id,),
+                notification_parents=(
+                    review_id,
+                    *(approval[0]["id"] for approval in stale_peer_approvals),
+                ),
             )
+            for sibling, _sibling_verdict, side_children, _sibling_head in stale_peer_approvals:
+                rewire_children(conn, sibling["id"], gate, side_children)
             rewire_and_archive(conn, review_id, gate, downstream, digest)
             conn.commit()
             return f"gated {review_id} -> {gate} after {depth} remediation generations"
@@ -763,6 +979,24 @@ def apply_transition(db_path: Path, review_id: str, owner_profile: str) -> str |
             idempotency_key=f"ttf-rereview-{review_id}-{digest}",
             parents=(remediation,),
         )
+        for sibling, sibling_verdict, side_children, _sibling_head in peer_approvals:
+            peer_review = insert_task(
+                conn,
+                title=f"Refresh prior approval from {sibling['id']} after {remediation}",
+                body=peer_rereview_body(
+                    sibling["id"], producer["id"], remediation, sibling_verdict
+                ),
+                assignee=sibling["assignee"],
+                status="todo",
+                workspace_path=workspace_path,
+                tenant=tenant,
+                idempotency_key=(
+                    f"ttf-rereview-{review_id}-peer-{sibling['id']}-{digest}"
+                ),
+                parents=(remediation,),
+                notification_parents=(sibling["id"],),
+            )
+            rewire_children(conn, sibling["id"], peer_review, side_children)
         rewire_and_archive(conn, review_id, follow_up, downstream, digest)
         conn.commit()
         return f"remediated {review_id} -> {remediation} -> {follow_up}"

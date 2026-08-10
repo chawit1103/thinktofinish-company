@@ -8,9 +8,6 @@ compatibility: Hermes Agent with Kanban and ThinkToFinish Company MCP tools enab
 metadata:
   category: orchestration
   layer: company
-  hermes:
-    tags: [orchestration, kanban]
-    related_skills: [product-discovery, architecture-contract, engineering-delivery, qa-release-gate]
 ---
 # Company Orchestrator
 

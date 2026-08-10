@@ -50,10 +50,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTIVE_HOME="$(strip_trailing_slashes "${HERMES_HOME:-$HOME/.hermes}")"
 require_safe_root "$ACTIVE_HOME" HERMES_HOME
 ACTIVE_PARENT="${ACTIVE_HOME%/*}"
-if [[ "${ACTIVE_PARENT##*/}" == "profiles" ]]; then
+RESOLVED_ACTIVE_HOME="$(canonical_path "$ACTIVE_HOME")"
+RESOLVED_ACTIVE_PARENT="${RESOLVED_ACTIVE_HOME%/*}"
+ACTIVE_PROFILE_HINT="${HERMES_PROFILE_NAME:-${HERMES_PROFILE:-}}"
+if [[ "${ACTIVE_PARENT##*/}" == "profiles" && (
+  -f "$ACTIVE_HOME/profile.yaml" || "$ACTIVE_PROFILE_HINT" == "${ACTIVE_HOME##*/}"
+) ]]; then
   SHARED_HOME="${ACTIVE_PARENT%/*}"
+elif [[ "${RESOLVED_ACTIVE_PARENT##*/}" == "profiles" && (
+  -f "$RESOLVED_ACTIVE_HOME/profile.yaml" || "$ACTIVE_PROFILE_HINT" == "${RESOLVED_ACTIVE_HOME##*/}"
+) ]]; then
+  SHARED_HOME="${RESOLVED_ACTIVE_PARENT%/*}"
 else
-  SHARED_HOME="$ACTIVE_HOME"
+  SHARED_HOME="$RESOLVED_ACTIVE_HOME"
 fi
 SHARED_HOME="$(canonical_path "$SHARED_HOME")"
 require_safe_root "$SHARED_HOME" "shared Hermes home"
@@ -173,6 +182,7 @@ CURRENT_WAS_ACTIVE=0
 JOB_ID=""
 JOB_STATE=""
 ORIGINAL_ACTIVE_JOB_IDS=()
+ORIGINAL_JOB_IDS=()
 if [[ -n "$JOB_INFO" ]]; then
   CANONICAL_JOB="$(printf '%s\n' "$JOB_INFO" | awk '
     NR == 1 { fallback=$0 }
@@ -183,6 +193,7 @@ if [[ -n "$JOB_INFO" ]]; then
   JOB_STATE="${CANONICAL_JOB#* }"
   [[ "$JOB_STATE" != "active" ]] || CURRENT_WAS_ACTIVE=1
   while read -r CURRENT_ID CURRENT_STATE; do
+    ORIGINAL_JOB_IDS+=("$CURRENT_ID")
     [[ "$CURRENT_STATE" != "active" ]] || ORIGINAL_ACTIVE_JOB_IDS+=("$CURRENT_ID")
   done <<< "$JOB_INFO"
 fi
@@ -204,6 +215,22 @@ finish_engine_files() {
   set +e
   if [[ "$ENGINE_FILES_COMMITTED" -ne 1 ]]; then
     [[ -z "$JOB_ID" ]] || "${HERMES_CMD[@]}" cron pause "$JOB_ID" >/dev/null 2>&1 || rollback_failed=1
+    if ROLLBACK_CRON_LIST="$("${HERMES_CMD[@]}" cron list --all)"; then
+      while read -r CURRENT_ID CURRENT_STATE; do
+        [[ "$CURRENT_STATE" == "active" ]] || continue
+        WAS_ORIGINAL=0
+        if (( ${#ORIGINAL_JOB_IDS[@]} )); then
+          for ORIGINAL_ID in "${ORIGINAL_JOB_IDS[@]}"; do
+            [[ "$CURRENT_ID" != "$ORIGINAL_ID" ]] || WAS_ORIGINAL=1
+          done
+        fi
+        if [[ "$WAS_ORIGINAL" -eq 0 ]]; then
+          "${HERMES_CMD[@]}" cron pause "$CURRENT_ID" >/dev/null 2>&1 || rollback_failed=1
+        fi
+      done < <(cron_jobs_in "$ROLLBACK_CRON_LIST" "$JOB_NAME")
+    else
+      rollback_failed=1
+    fi
     if (( ${#ORIGINAL_ACTIVE_JOB_IDS[@]} )); then
       for CURRENT_ID in "${ORIGINAL_ACTIVE_JOB_IDS[@]}"; do
         "${HERMES_CMD[@]}" cron pause "$CURRENT_ID" >/dev/null 2>&1 || rollback_failed=1

@@ -8,9 +8,6 @@ compatibility: Hermes Agent coding worker; worktree and normal producer cards re
 metadata:
   category: engineering
   layer: company
-  hermes:
-    tags: [engineering, verification]
-    related_skills: [architecture-contract, qa-release-gate]
 ---
 # Engineering Delivery
 

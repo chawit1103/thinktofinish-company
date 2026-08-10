@@ -8,9 +8,6 @@ compatibility: Hermes Agent; web/research tools are useful but not mandatory.
 metadata:
   category: product
   layer: company
-  hermes:
-    tags: [product, requirements]
-    related_skills: [architecture-contract, company-orchestrator]
 ---
 # Product Discovery
 

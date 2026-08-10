@@ -8,9 +8,6 @@ compatibility: Hermes Agent reviewer or release profile with project and CI acce
 metadata:
   category: quality
   layer: company
-  hermes:
-    tags: [quality, review, release]
-    related_skills: [engineering-delivery, company-orchestrator]
 ---
 # QA and Release Gate
 

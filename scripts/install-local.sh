@@ -42,10 +42,19 @@ canonical_path() {
 ACTIVE_HOME="$(strip_trailing_slashes "${HERMES_HOME:-$HOME/.hermes}")"
 require_safe_root "$ACTIVE_HOME" HERMES_HOME
 ACTIVE_PARENT="${ACTIVE_HOME%/*}"
-if [[ "${ACTIVE_PARENT##*/}" == "profiles" ]]; then
+RESOLVED_ACTIVE_HOME="$(canonical_path "$ACTIVE_HOME")"
+RESOLVED_ACTIVE_PARENT="${RESOLVED_ACTIVE_HOME%/*}"
+ACTIVE_PROFILE_HINT="${HERMES_PROFILE_NAME:-${HERMES_PROFILE:-}}"
+if [[ "${ACTIVE_PARENT##*/}" == "profiles" && (
+  -f "$ACTIVE_HOME/profile.yaml" || "$ACTIVE_PROFILE_HINT" == "${ACTIVE_HOME##*/}"
+) ]]; then
   SHARED_HOME="${ACTIVE_PARENT%/*}"
+elif [[ "${RESOLVED_ACTIVE_PARENT##*/}" == "profiles" && (
+  -f "$RESOLVED_ACTIVE_HOME/profile.yaml" || "$ACTIVE_PROFILE_HINT" == "${RESOLVED_ACTIVE_HOME##*/}"
+) ]]; then
+  SHARED_HOME="${RESOLVED_ACTIVE_PARENT%/*}"
 else
-  SHARED_HOME="$ACTIVE_HOME"
+  SHARED_HOME="$RESOLVED_ACTIVE_HOME"
 fi
 SHARED_HOME="$(canonical_path "$SHARED_HOME")"
 require_safe_root "$SHARED_HOME" "shared Hermes home"
@@ -84,18 +93,25 @@ BACKUP=""
 INSTALLED=0
 rollback() {
   local status=$?
+  local rollback_failed=0
+  trap - EXIT HUP INT TERM
+  set +e
   if [[ $status -ne 0 ]]; then
     [[ -z "$STAGE" || ! -e "$STAGE" ]] || rm -rf "$STAGE"
-    if [[ -n "$BACKUP" && -e "$BACKUP" ]]; then
-      [[ ! -e "$TARGET" ]] || rm -rf "$TARGET"
-      mv "$BACKUP" "$TARGET"
-    elif [[ "$INSTALLED" -eq 1 && -e "$TARGET" ]]; then
-      rm -rf "$TARGET"
+    if [[ -n "$BACKUP" && ( -e "$BACKUP" || -L "$BACKUP" ) ]]; then
+      [[ ! -e "$TARGET" && ! -L "$TARGET" ]] || rm -rf "$TARGET" || rollback_failed=1
+      mv "$BACKUP" "$TARGET" || rollback_failed=1
+    elif [[ "$INSTALLED" -eq 1 && ( -e "$TARGET" || -L "$TARGET" ) ]]; then
+      rm -rf "$TARGET" || rollback_failed=1
     fi
   fi
+  [[ "$rollback_failed" -eq 0 ]] || status=1
   exit "$status"
 }
 trap rollback EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Copy the portable package without local build/cache state.
 tar -C "$SOURCE" \
@@ -112,17 +128,17 @@ if [[ -e "$TARGET" || -L "$TARGET" ]]; then
   [[ ! -e "$BACKUP" ]] || { echo "Backup path already exists: $BACKUP" >&2; exit 1; }
   mv "$TARGET" "$BACKUP"
 fi
+INSTALLED=1
 mv "$STAGE" "$TARGET"
 STAGE=""
-INSTALLED=1
 
 chmod +x "$TARGET/scripts/"*.sh 2>/dev/null || true
 "${HERMES_CMD[@]}" plugins enable thinktofinish-company --no-allow-tool-override >/dev/null
+trap - EXIT HUP INT TERM
 if [[ -n "$BACKUP" ]]; then
   rm -rf "$BACKUP"
   BACKUP=""
 fi
-trap - EXIT
 
 echo "Installed and enabled thinktofinish-company for profile: $PROFILE"
 echo "Location: $TARGET"

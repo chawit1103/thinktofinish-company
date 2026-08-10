@@ -8,9 +8,6 @@ compatibility: Hermes Agent software projects.
 metadata:
   category: architecture
   layer: company
-  hermes:
-    tags: [architecture, contracts]
-    related_skills: [product-discovery, engineering-delivery]
 ---
 # Architecture Contract
 

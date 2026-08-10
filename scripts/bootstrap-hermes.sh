@@ -22,10 +22,19 @@ canonical_path() {
 ACTIVE_HOME="$(strip_trailing_slashes "${HERMES_HOME:-$HOME/.hermes}")"
 require_safe_root "$ACTIVE_HOME" HERMES_HOME
 ACTIVE_PARENT="${ACTIVE_HOME%/*}"
-if [[ "${ACTIVE_PARENT##*/}" == "profiles" ]]; then
+RESOLVED_ACTIVE_HOME="$(canonical_path "$ACTIVE_HOME")"
+RESOLVED_ACTIVE_PARENT="${RESOLVED_ACTIVE_HOME%/*}"
+ACTIVE_PROFILE_HINT="${HERMES_PROFILE_NAME:-${HERMES_PROFILE:-}}"
+if [[ "${ACTIVE_PARENT##*/}" == "profiles" && (
+  -f "$ACTIVE_HOME/profile.yaml" || "$ACTIVE_PROFILE_HINT" == "${ACTIVE_HOME##*/}"
+) ]]; then
   SHARED_HOME="${ACTIVE_PARENT%/*}"
+elif [[ "${RESOLVED_ACTIVE_PARENT##*/}" == "profiles" && (
+  -f "$RESOLVED_ACTIVE_HOME/profile.yaml" || "$ACTIVE_PROFILE_HINT" == "${RESOLVED_ACTIVE_HOME##*/}"
+) ]]; then
+  SHARED_HOME="${RESOLVED_ACTIVE_PARENT%/*}"
 else
-  SHARED_HOME="$ACTIVE_HOME"
+  SHARED_HOME="$RESOLVED_ACTIVE_HOME"
 fi
 SHARED_HOME="$(canonical_path "$SHARED_HOME")"
 require_safe_root "$SHARED_HOME" "shared Hermes home"
