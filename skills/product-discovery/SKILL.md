@@ -1,11 +1,16 @@
 ---
 name: product-discovery
-description: Turn a rough software idea into evidence-backed requirements and a product specification suitable for autonomous delivery.
+description: Turn software ideas into evidence-backed requirements.
+version: 0.2.0
+author: ThinkToFinish
 license: MIT
 compatibility: Hermes Agent; web/research tools are useful but not mandatory.
 metadata:
   category: product
   layer: company
+  hermes:
+    tags: [product, requirements]
+    related_skills: [architecture-contract, company-orchestrator]
 ---
 # Product Discovery
 

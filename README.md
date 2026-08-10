@@ -85,7 +85,7 @@ Hermes loads the read-only namespaced skills and starts the local stdio MCP serv
 - `company-orchestrator` — use Hermes Kanban as the macro graph; never implement production code from the orchestrator.
 - `product-discovery` — create stable requirement IDs and acceptance criteria.
 - `architecture-contract` — produce ADRs, boundaries, contracts, and verification plans.
-- `engineering-delivery` — implement in a worktree/branch, use goal loops and deterministic gates, leave evidence.
+- `engineering-delivery` — implement in a worktree/branch, use an internal repair loop and deterministic gates, then leave a reviewed handoff.
 - `qa-release-gate` — independent review, security, traceability, and release-candidate evidence.
 
 ### Mini-HRMS pilot
@@ -202,7 +202,7 @@ The kickoff card creates Product → Architecture → a second orchestrator plan
 Keep the Hermes gateway running:
 
 ```bash
-hermes gateway start
+hermes -p orchestrator gateway start
 ```
 
 Open the dashboard:
@@ -217,7 +217,7 @@ The intended pattern is:
 
 ```text
 Kanban Graph = macro workflow
-Goal Loop    = micro workflow
+Worker Loop  = bounded repair/verification workflow
 ```
 
 For example, an engineering card should iterate:
@@ -243,7 +243,15 @@ Enable the board-scoped transition engine after creating a pilot:
 ./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
 ```
 
-It installs one no-agent cron for that board only. Reviewers write a structured `ttf_review` verdict; on `changes_requested`, the engine creates a remediation/re-review pair, rewires downstream dependencies to the replacement review, and archives the rejected review as evidence. It never approves a review, bypasses a human gate, deploys, pushes `main`, or handles real credentials/PII.
+It installs one no-agent cron for that board only. Reviewers write a structured `ttf_review` verdict; on `changes_requested`, the engine creates a remediation/re-review pair, rewires downstream dependencies to the replacement review, and archives the rejected review as evidence. After three rejected remediation generations it creates one retained owner-input gate and leaves downstream work gated. It never approves a review, bypasses a typed human/capability gate, deploys, pushes `main`, or handles real credentials/PII.
+
+When upgrading a board that still has a legacy handoff/governor cron, first migrate every reviewer profile to the structured verdict contract above, then take over explicitly:
+
+```bash
+./scripts/enable-kanban-autopilot.sh --profile orchestrator --replace-legacy mini-hrms
+```
+
+The installer scans every Hermes profile, pauses each matching active legacy job, and converges duplicate/current jobs to one infinite no-agent cron. Re-run the same command for each managed board after updating this plugin so its installed engine copy is refreshed.
 
 ---
 
@@ -449,6 +457,7 @@ Runtime policy source-of-truth in V0.1 is the JSON set:
 ```text
 policies/company.json
 policies/autonomy.json
+policies/kanban-autopilot.json
 policies/quality.json
 policies/security.json
 ```
@@ -504,8 +513,7 @@ Until then, `scripts/install-local.sh` performs the equivalent local installatio
 
 V0.1 intentionally **does not** rebuild capabilities Hermes already owns:
 
-- No custom graph engine
-- No custom dispatcher/scheduler
+- No replacement graph scheduler/dispatcher; only a narrow deterministic review-transition reconciler
 - No custom Agent runtime
 - No custom worktree manager
 - No custom Goal loop

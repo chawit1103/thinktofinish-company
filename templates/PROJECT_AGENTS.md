@@ -9,7 +9,7 @@ This project is operated by the ThinkToFinish AI Software Company model on Herme
 - Graph = Organization
 - Governance = Company
 - One Hermes Kanban Board = one project
-- Kanban = macro workflow; goal-mode card = micro repair/verification loop
+- Kanban = macro workflow; each worker uses a bounded internal repair/verification loop
 
 `goal_mode` is for a card that can satisfy its own acceptance criteria. A code producer with an independent reviewer child must not use it: a verified `review-required:` handoff completes the producer and dispatches the reviewer.
 
@@ -25,7 +25,7 @@ This project is operated by the ThinkToFinish AI Software Company model on Herme
 8. Direct push to main, bypassing required review, disabling security controls, and exposing credentials are forbidden.
 9. Autonomous work ends at Release Candidate unless an explicit production approval gate is satisfied.
 10. Preserve existing project-specific conventions and tighter security rules; this document is a floor, not permission to weaken them.
-11. Reserve `blocked` for a retained human gate, a hard safety boundary, or a truly unavailable capability. Review waiting, dependencies, and ordinary technical decisions advance through the Kanban graph automatically.
+11. Reserve retained `blocked` states for a human gate, a hard safety boundary, or a truly unavailable capability. An untyped review block may briefly trigger deterministic remediation; review waiting, dependencies, and ordinary technical decisions advance automatically.
 
 ## Required Evidence
 

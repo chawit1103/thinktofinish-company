@@ -2,6 +2,35 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+strip_trailing_slashes() {
+  local value="$1"
+  while [[ "$value" != "/" && "$value" == */ ]]; do value="${value%/}"; done
+  printf '%s' "$value"
+}
+
+require_safe_root() {
+  [[ -n "$1" && "$1" == /* && "$1" != "/" ]] || {
+    echo "$2 must be a non-root absolute path: ${1:-<empty>}" >&2
+    exit 2
+  }
+}
+
+canonical_path() {
+  python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
+}
+
+ACTIVE_HOME="$(strip_trailing_slashes "${HERMES_HOME:-$HOME/.hermes}")"
+require_safe_root "$ACTIVE_HOME" HERMES_HOME
+ACTIVE_PARENT="${ACTIVE_HOME%/*}"
+if [[ "${ACTIVE_PARENT##*/}" == "profiles" ]]; then
+  SHARED_HOME="${ACTIVE_PARENT%/*}"
+else
+  SHARED_HOME="$ACTIVE_HOME"
+fi
+SHARED_HOME="$(canonical_path "$SHARED_HOME")"
+require_safe_root "$SHARED_HOME" "shared Hermes home"
+export HERMES_HOME="$SHARED_HOME"
+
 if ! command -v hermes >/dev/null 2>&1; then
   echo "Hermes is not installed or not on PATH." >&2
   exit 1
@@ -10,7 +39,12 @@ fi
 install_charter() {
   local name="$1"
   local charter="$ROOT/profiles/$name.md"
-  local hroot="${HERMES_HOME:-$HOME/.hermes}/profiles/$name"
+  local hroot="$SHARED_HOME/profiles/$name"
+  hroot="$(canonical_path "$hroot")"
+  if [[ "$hroot" != "$SHARED_HOME/"* ]]; then
+    echo "Profile home resolves outside shared Hermes home: $hroot" >&2
+    exit 2
+  fi
   local soul="$hroot/SOUL.md"
   [[ -f "$charter" ]] || return 0
   mkdir -p "$hroot"
@@ -41,7 +75,7 @@ create_profile() {
   else
     hermes profile create "$name" --description "$desc"
   fi
-  "$ROOT/scripts/install-local.sh" --profile "$name"
+  HERMES_HOME="$SHARED_HOME" "$ROOT/scripts/install-local.sh" --profile "$name"
   install_charter "$name"
 }
 
@@ -53,11 +87,11 @@ create_profile qa-reviewer "Independently reviews changes, regression evidence, 
 create_profile release-manager "Assembles release evidence, checks CI and traceability, coordinates release candidates, and stops at production human gates."
 
 # Enable the portable layer in the default profile too, useful for interactive control.
-"$ROOT/scripts/install-local.sh" --profile default
+HERMES_HOME="$SHARED_HOME" "$ROOT/scripts/install-local.sh" --profile default
 
 echo
 echo "Profiles created and Company Layer installed."
 echo "Next: create a board with scripts/create-pilot.sh /absolute/path/to/project"
-echo "Then start the gateway: hermes gateway start"
+echo "Then start the gateway: hermes -p orchestrator gateway start"
 echo "No global Kanban settings were changed. The pilot uses a dispatcher-spawned orchestrator card, so Kanban task tools are injected automatically."
 echo "Optional: enable the 'kanban' toolset on the orchestrator profile only if you want interactive orchestrator chats to route board work."

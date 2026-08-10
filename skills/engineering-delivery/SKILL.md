@@ -1,11 +1,16 @@
 ---
 name: engineering-delivery
-description: Implement a Company Task Contract in an isolated workspace, verify it with deterministic gates, and leave structured handoff evidence.
+description: Implement and verify scoped software changes for review.
+version: 0.2.0
+author: ThinkToFinish
 license: MIT
-compatibility: Hermes Agent coding worker; worktree and goal-mode cards recommended.
+compatibility: Hermes Agent coding worker; worktree and normal producer cards recommended.
 metadata:
   category: engineering
   layer: company
+  hermes:
+    tags: [engineering, verification]
+    related_skills: [architecture-contract, qa-release-gate]
 ---
 # Engineering Delivery
 
@@ -21,7 +26,7 @@ Use on implementation, refactor, bug-fix, migration, or integration cards that h
 6. Run all listed verification commands. A claim of success is not evidence.
 7. If a gate fails, diagnose from actual output, repair, and rerun. This is the micro Loop.
 8. Record trace links for task → commit/PR/test as those artifacts become known.
-9. Complete the Kanban card with structured metadata: changed files, verification commands/results, dependencies, retry notes, and residual risk.
+9. Complete the Kanban card with a `review-required:` commit handoff and structured metadata: changed files, verification commands/results, dependencies, retry notes, and residual risk.
 10. Never directly push to main, bypass review, expose credentials, or deploy production.
 
 ## Evidence Standard

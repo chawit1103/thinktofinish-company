@@ -1,11 +1,16 @@
 ---
 name: company-orchestrator
-description: Orchestrate software delivery with Hermes Kanban using Company Policy, Task Contracts, evidence, and human gates.
+description: Orchestrate governed delivery with Hermes Kanban.
+version: 0.2.0
+author: ThinkToFinish
 license: MIT
 compatibility: Hermes Agent with Kanban and ThinkToFinish Company MCP tools enabled.
 metadata:
   category: orchestration
   layer: company
+  hermes:
+    tags: [orchestration, kanban]
+    related_skills: [product-discovery, architecture-contract, engineering-delivery, qa-release-gate]
 ---
 # Company Orchestrator
 
@@ -16,7 +21,7 @@ Use when a user gives a product or software outcome rather than a single impleme
 Treat Hermes as the execution OS and this skill as company governance.
 
 - **Agent = Capability**: route work to the best profile.
-- **Loop = Reliability**: use goal-mode cards for work that must iterate until explicit acceptance criteria are met.
+- **Loop = Reliability**: use bounded internal repair loops; reserve goal-mode for self-contained orchestration/research work.
 - **Graph = Organization**: use Kanban dependencies for macro workflow and parallelism.
 - **Governance = Company**: call `ttf_policy_check`, validate contracts, preserve traceability, and enforce release evidence.
 
@@ -40,8 +45,8 @@ Treat Hermes as the execution OS and this skill as company governance.
 - A producer cannot be the only judge of its own output.
 - Pre-create a read-only reviewer child for every code producer. A `review-required:` handoff completes the producer and promotes that child; never mark review waiting as `blocked`.
 - QA/security and release gates depend on the approved integration reviewer child, never the integration producer directly.
-- A reviewer `REQUEST_CHANGES` creates one remediation producer and its reviewer child automatically. Preserve failed cards as evidence; do not require an operator to repair ordinary graph transitions.
-- Reserve `blocked` for a retained human gate, a real safety boundary, or an unavailable required capability after safe alternatives. Dependency waits and routine tool approval timeouts are not human-input blocks.
+- A reviewer `changes_requested` verdict creates one remediation producer and its reviewer child automatically. Preserve failed cards as evidence; do not require an operator to repair ordinary graph transitions.
+- Reserve retained `blocked` states for a human gate, a real safety boundary, or an unavailable required capability after safe alternatives. An untyped review block may briefly trigger deterministic remediation; dependency waits and routine tool approval timeouts are not human-input blocks.
 - Do not expose secrets in Kanban metadata or traceability metadata.
 - Business scope, production deployment, destructive migrations, paid purchases, credentials, and security exceptions are human-gated by policy.
 

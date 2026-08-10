@@ -3,7 +3,7 @@
     "required_comment": "ttf_review",
     "transition": "create_remediation_and_rereview_then_rewire_downstream_children"
   },
-  "blocked_allowed_only_for": [
+  "retained_blocked_allowed_only_for": [
     "retained_human_gate",
     "secrets_or_real_pii",
     "production_or_destructive_operation",

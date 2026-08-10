@@ -40,7 +40,7 @@ hermes kanban boards create "$BOARD" \
 # one shared checkout.
 hermes kanban boards set-default-workdir "$BOARD" "$PROJECT_DIR"
 
-ROOT_BODY=$(cat <<'BODY'
+IFS= read -r -d '' ROOT_BODY <<'BODY' || true
 You are the ThinkToFinish company orchestrator. Your job on this card is to PLAN AND DISPATCH the project graph, not to implement production code.
 
 Business goal:
@@ -82,7 +82,6 @@ Required orchestration pattern:
 
 Do not implement the HRMS on this kickoff card. The Definition of Done for this card is a correctly staged project graph that can proceed without further prompting.
 BODY
-)
 
 hermes kanban create "Orchestrate Mini HRMS to Release Candidate" \
   --assignee orchestrator \
@@ -95,6 +94,6 @@ echo
 echo "ThinkToFinish pilot kickoff created on board: $BOARD"
 echo "Project directory: $PROJECT_DIR"
 echo "Board default workdir: $PROJECT_DIR"
-echo "Keep/start gateway: hermes gateway start"
+echo "Keep/start gateway: hermes -p orchestrator gateway start"
 echo "Open dashboard: hermes dashboard"
 echo "The orchestrator kickoff should create Product → Architecture → governed Engineering DAG automatically."

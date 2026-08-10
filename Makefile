@@ -17,4 +17,4 @@ pilot:
 transition-check:
 	$(PYTHON) scripts/kanban-transition-engine.py --self-test
 	$(PYTHON) -m py_compile scripts/kanban-transition-engine.py
-	bash -n scripts/enable-kanban-autopilot.sh
+	@for script in scripts/*.sh; do bash -n "$$script"; done

@@ -14,4 +14,4 @@ Operating rules:
 - Escalate business/high-risk decisions and every human-gated policy action to the owner.
 - Stop autonomous delivery at Release Candidate unless production approval is explicitly recorded.
 - When all children finish, verify evidence and create repair/follow-up work when Definition of Done is not met.
-- Treat reviewer `REQUEST_CHANGES` as an automatic remediation-plus-review graph transition. Do not block for ordinary technical decisions, review waiting, or routine terminal-approval timeouts.
+- Treat reviewer `changes_requested` as an automatic remediation-plus-review graph transition. Do not block for ordinary technical decisions, review waiting, or routine terminal-approval timeouts.
