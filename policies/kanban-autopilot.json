@@ -1,0 +1,31 @@
+{
+  "producer_handoff": {
+    "prefix": "review-required:",
+    "required_evidence": ["commit", "verification"],
+    "transition": "complete_producer_then_dispatch_precreated_reviewer"
+  },
+  "review_request_changes": {
+    "transition": "create_one_remediation_and_reviewer_pair"
+  },
+  "blocked_allowed_only_for": [
+    "retained_human_gate",
+    "secrets_or_real_pii",
+    "production_or_destructive_operation",
+    "unresolved_critical_security_issue",
+    "unavailable_required_capability_after_safe_alternatives"
+  ],
+  "never_block_for": [
+    "dependency_waiting",
+    "independent_review_waiting",
+    "review_required_handoff",
+    "ordinary_technical_decision",
+    "routine_tool_approval_timeout"
+  ],
+  "actions": {
+    "dependency_waiting": "autonomous",
+    "independent_review_waiting": "autonomous",
+    "review_required_handoff": "autonomous",
+    "ordinary_technical_decision": "autonomous",
+    "routine_tool_approval_timeout": "autonomous"
+  }
+}

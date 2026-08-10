@@ -12,9 +12,9 @@ import subprocess
 from pathlib import Path
 
 COMMIT = re.compile(r"\bcommit\s+[0-9a-f]{7,64}\b", re.IGNORECASE)
-VERIFICATION = re.compile(r"\b(?:pytest|tests?|checks?|validation|verification)\b.{0,48}\b(?:pass(?:ed)?|succeed(?:ed)?|verified)\b", re.IGNORECASE)
+VERIFICATION = re.compile(r"\b(?:pytest|tests?|checks?|validation|verification)\b[\s\S]{0,48}\b(?:pass(?:ed)?|succeed(?:ed)?|verified)\b", re.IGNORECASE)
 FAILED_VERIFICATION = re.compile(
-    r"\b(?:[1-9]\d*\s+(?:failed|failures?|errors?)|(?:pytest|tests?|checks?|validation|verification)\b.{0,32}\b(?:failed|failure|errors?|not\s+pass(?:ed)?))\b",
+    r"\b(?:[1-9]\d*\s+(?:failed|failures?|errors?)|(?:pytest|tests?|checks?|validation|verification)\b[\s\S]{0,32}\b(?:failed|failure|errors?|not\s+pass(?:ed)?))\b",
     re.IGNORECASE,
 )
 ZERO_FAILURES = re.compile(r"\b0\s+(?:failed|failures?|errors?)\b", re.IGNORECASE)
@@ -46,6 +46,7 @@ def main() -> int:
         assert not eligible("review-required: abcdef1; pytest passed", 1)
         assert not eligible("review-required: commit abcdef1; pytest: 2 passed, 1 failed", 1)
         assert not eligible("review-required: commit abcdef1; tests not passed", 1)
+        assert not eligible("review-required: commit abcdef1; pytest passed\nruff failed", 1)
         assert eligible("review-required: commit abcdef1; 71 tests + 47 subtests pass; 0 failed", 1)
         assert not eligible("review-required: commit abcdef1", 0)
         print("self-test passed")
@@ -76,6 +77,7 @@ def main() -> int:
             subprocess.run(
                 ["hermes", "kanban", "--board", args.board, "complete", task_id, "--summary", summary, "--metadata", metadata],
                 check=True,
+                env={**os.environ, "HERMES_HOME": args.home},
             )
             print(f"completed {args.board}/{task_id} -> independent review")
     return 0

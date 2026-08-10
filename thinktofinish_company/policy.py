@@ -10,10 +10,11 @@ VALID_DECISIONS = {"autonomous", "human_approval", "forbidden"}
 
 def check_policy(action: str, risk: str = "medium", context: str = "") -> dict[str, Any]:
     autonomy = load_yaml("policies/autonomy.yaml")
+    kanban = load_yaml("policies/kanban-autopilot.yaml")
     security = load_yaml("policies/security.yaml")
 
     normalized = action.strip().lower().replace(" ", "_")
-    actions = autonomy.get("actions", {})
+    actions = {**autonomy.get("actions", {}), **kanban.get("actions", {})}
     decision = actions.get(normalized, autonomy.get("default", "human_approval"))
     if decision not in VALID_DECISIONS:
         decision = "human_approval"

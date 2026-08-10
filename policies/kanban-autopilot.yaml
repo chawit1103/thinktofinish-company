@@ -17,3 +17,9 @@ never_block_for:
   - review_required_handoff
   - ordinary_technical_decision
   - routine_tool_approval_timeout
+actions:
+  dependency_waiting: autonomous
+  independent_review_waiting: autonomous
+  review_required_handoff: autonomous
+  ordinary_technical_decision: autonomous
+  routine_tool_approval_timeout: autonomous
