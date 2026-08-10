@@ -713,6 +713,70 @@ def test_shared_workspace_defers_until_fresh_verdict(tmp_path, monkeypatch):
     assert head_checks == 3
 
 
+@pytest.mark.parametrize("status", ["todo", "ready", "running", "review"])
+def test_runnable_sibling_reviewer_defers_before_head_probe(tmp_path, monkeypatch, status):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_rejected", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_sibling", status, "security", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_rejected"), ("t_prod", "t_sibling")],
+        [("t_rejected", VERDICT)],
+    )
+
+    def unexpected_head(_task):
+        raise AssertionError("an executable sibling must reserve the checkout before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_shared_checkout_worker_defers_without_unrelated_task_deadlock(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_rejected", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_other_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_worker", "ready", "developer", "dir", str(workspace), None, None, None, None),
+            ("t_scratch", "running", "researcher", "scratch", None, None, None, None, None),
+            ("t_waiting", "todo", "release", "dir", str(workspace), None, None, None, None),
+            ("t_triage", "triage", "orchestrator", "dir", str(workspace), None, None, None, None),
+            ("t_invalid", "running", "researcher", "dir", str(other_workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_rejected"),
+            ("t_other_prod", "t_worker"),
+            ("t_prod", "t_waiting"),
+            ("t_rejected", "t_waiting"),
+        ],
+        [("t_rejected", VERDICT)],
+    )
+    head_checks = 0
+
+    def checked_head(_task):
+        nonlocal head_checks
+        head_checks += 1
+        return "abc1234"
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", checked_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    assert head_checks == 0
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE id='t_worker'")
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(result) == 1 and result[0].startswith("remediated t_rejected -> ")
+    assert head_checks == 1
+
+
 def test_dry_run_reserves_one_shared_workspace_lane(tmp_path):
     home, db_path, workspace = make_board(tmp_path)
     add_tasks(

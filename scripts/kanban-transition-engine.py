@@ -448,11 +448,20 @@ def transition_digest(
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
-def candidate_shares_checkout(candidate: sqlite3.Row, producer_root: Path) -> bool:
+def candidate_shares_checkout(
+    candidate: sqlite3.Row, producer_root: Path, *, fail_closed: bool = True
+) -> bool:
     raw_path = candidate["workspace_path"]
     if not isinstance(raw_path, str) or not raw_path or not Path(raw_path).expanduser().is_absolute():
-        raise ValueError(f"active transition {candidate['id']} has an unverifiable workspace")
-    candidate_path = Path(raw_path).expanduser().resolve()
+        if fail_closed:
+            raise ValueError(f"active transition {candidate['id']} has an unverifiable workspace")
+        return False
+    try:
+        candidate_path = Path(raw_path).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        if fail_closed:
+            raise ValueError(f"active transition {candidate['id']} has an unverifiable workspace") from exc
+        return False
     if (
         candidate_path == producer_root
         or candidate_path.is_relative_to(producer_root)
@@ -462,7 +471,9 @@ def candidate_shares_checkout(candidate: sqlite3.Row, producer_root: Path) -> bo
     try:
         return checkout_root(candidate["id"], raw_path) == producer_root
     except ValueError as exc:
-        raise ValueError(f"active transition {candidate['id']} has an unverifiable workspace") from exc
+        if fail_closed:
+            raise ValueError(f"active transition {candidate['id']} has an unverifiable workspace") from exc
+        return False
 
 
 def transition_plan(conn: sqlite3.Connection, review_id: str):
@@ -500,21 +511,29 @@ def transition_plan(conn: sqlite3.Connection, review_id: str):
         raise ValueError(f"review {review_id} already has an active or conflicting transition")
     producer_workspace = workspace(producer).removeprefix("dir:")
     candidates = conn.execute(
-        "SELECT t.id, t.workspace_path, EXISTS ("
-        "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id) AS same_producer "
-        "FROM tasks t WHERE t.id!=? "
-        "AND t.status NOT IN ('done', 'archived') "
-        "AND (instr(COALESCE(t.idempotency_key, ''), 'ttf-remediation-')=1 "
+        "WITH candidates AS (SELECT t.*, EXISTS ("
+        "SELECT 1 FROM task_links l WHERE l.parent_id=? AND l.child_id=t.id) AS same_producer, "
+        "(instr(COALESCE(t.idempotency_key, ''), 'ttf-remediation-')=1 "
         "OR instr(COALESCE(t.idempotency_key, ''), 'ttf-rereview-')=1 "
         "OR instr(COALESCE(t.idempotency_key, ''), 'ttf-review-gate-')=1 "
-        "OR instr(COALESCE(t.idempotency_key, ''), 'ttf-refresh-review-')=1)",
+        "OR instr(COALESCE(t.idempotency_key, ''), 'ttf-refresh-review-')=1) AS engine_transition, "
+        "NOT EXISTS (SELECT 1 FROM task_links pl JOIN tasks p ON p.id=pl.parent_id "
+        "WHERE pl.child_id=t.id AND p.status NOT IN ('done', 'archived')) AS parents_terminal "
+        "FROM tasks t WHERE t.id!=?) "
+        "SELECT id, workspace_path, same_producer, engine_transition FROM candidates WHERE "
+        "(status NOT IN ('done', 'archived') AND engine_transition) OR ("
+        "(current_run_id IS NOT NULL OR status IN ('running', 'review') "
+        "OR (status IN ('todo', 'ready') AND parents_terminal)) "
+        "AND (same_producer OR (workspace_kind IN ('dir', 'worktree') AND workspace_path IS NOT NULL)))",
         (producer["id"], review_id),
     ).fetchall()
     producer_root = Path(producer_workspace)
     for candidate in candidates:
         if candidate["same_producer"]:
             return None
-        if candidate_shares_checkout(candidate, producer_root):
+        if candidate_shares_checkout(
+            candidate, producer_root, fail_closed=bool(candidate["engine_transition"])
+        ):
             return None
     head = workspace_head(producer)
     reviewed_head = resolve_reviewed_commit(producer["id"], producer_root, verdict.reviewed_commit)
