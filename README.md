@@ -167,7 +167,7 @@ Recommended engineering policy:
 
 - One Board = one project
 - Coding tasks use `worktree`
-- Engineering cards use goal mode when the task requires iterative repair
+- Goal mode is only for self-contained orchestration/research loops; engineering producers use normal cards and pre-created independent reviewer children
 - Reviewer is not the producer
 - No direct push to `main`
 - Production credentials are not available to `engineer`
@@ -234,6 +234,16 @@ Research → Product Spec → Architecture
                       ├→ Frontend ├→ Integration → Review → Security → RC
                       └→ Data ────┘
 ```
+
+### Autonomous Kanban recovery
+
+Enable the board-scoped autopilot after creating a pilot:
+
+```bash
+./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
+```
+
+It installs two cron jobs for that board only: a no-agent handoff reconciler and a low-cost governor that wakes only when the Kanban state changes. They advance verified producer handoffs, create remediation/review pairs after ordinary review failures, and preserve failed work as archived evidence. They never approve a review, bypass a human gate, deploy, push `main`, or handle real credentials/PII.
 
 ---
 

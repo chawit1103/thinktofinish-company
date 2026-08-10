@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: test smoke doctor pilot
+.PHONY: test smoke doctor pilot autopilot-check
 
 test:
 	PYTHONPATH=. $(PYTHON) -m pytest -q
@@ -13,3 +13,8 @@ doctor:
 
 pilot:
 	@echo "Usage: ./scripts/create-pilot.sh /absolute/path/to/git-project [board-slug]"
+
+autopilot-check:
+	$(PYTHON) scripts/kanban-handoff-autopilot.py --self-test
+	python3 -m py_compile scripts/kanban-state-snapshot.py
+	bash -n scripts/enable-kanban-autopilot.sh
