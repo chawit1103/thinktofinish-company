@@ -17,7 +17,8 @@ Prepare a Git repo with at least one commit. Confirm the Hermes model/provider w
 
 ```bash
 ./scripts/create-pilot.sh /absolute/path/to/mini-hrms mini-hrms
-hermes gateway start
+./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
+hermes -p orchestrator gateway start
 hermes dashboard
 ```
 
@@ -41,13 +42,17 @@ The kickoff then completes.
 
 After Architecture completes, the second orchestrator reads upstream handoffs and should create:
 
-- 2–4 scoped implementation cards (`engineer`) where parallelism is safe
-- Integration card, parented on all implementation cards
-- Independent QA/Security card (`qa-reviewer`), parent=Integration
+- 2–4 scoped implementation producer cards (`engineer`) where parallelism is safe, each with a pre-created read-only reviewer child (`qa-reviewer`)
+- Integration producer, parented on approved implementation reviews, with its own pre-created reviewer child
+- Independent QA/Security card (`qa-reviewer`), parent=approved Integration reviewer child
 - Release Evidence card (`release-manager`), parent=QA/Security
 - Company Closeout card (`orchestrator`), parent=Release Evidence
 
-Implementation cards should be goal-mode and include explicit Company Task Contracts.
+Implementation producers use normal Kanban cards, not goal-mode: their terminal outcome is a verified `review-required:` commit handoff. Goal-mode is reserved for an orchestration/research card whose completion does not depend on a downstream child.
+
+The board-scoped transition engine reads structured reviewer verdicts. A `changes_requested` verdict creates a remediation/re-review pair, rewires downstream dependencies to the new review, refreshes completed approval gates invalidated by the new commit, and archives the rejected review as evidence. It permits one active transition per Git checkout and automatically replaces a deferred stale verdict with a fresh-review card. Three rejected remediation or stale-review generations trigger one retained owner-input gate while downstream work remains gated. Typed `needs_input` and `capability` blocks are never automated.
+
+For a legacy board, migrate every reviewer profile to the `ttf_review` contract before takeover, then run `./scripts/enable-kanban-autopilot.sh --profile orchestrator --replace-legacy mini-hrms`. This pauses matching active legacy graph jobs across every Hermes profile. Re-run it after plugin updates to refresh the board's installed engine copy.
 
 ### Phase C — release closeout
 

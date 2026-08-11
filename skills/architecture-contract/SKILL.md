@@ -1,6 +1,8 @@
 ---
 name: architecture-contract
-description: Convert product requirements into an implementation-ready architecture with boundaries, interfaces, risks, and verifiable decisions.
+description: Design implementation-ready architecture contracts.
+version: 0.2.0
+author: ThinkToFinish
 license: MIT
 compatibility: Hermes Agent software projects.
 metadata:

@@ -1,6 +1,8 @@
 ---
 name: qa-release-gate
-description: Independently review delivery evidence, validate requirement coverage, security posture, CI, and release readiness before handoff.
+description: Independently verify changes and release readiness.
+version: 0.2.0
+author: ThinkToFinish
 license: MIT
 compatibility: Hermes Agent reviewer or release profile with project and CI access.
 metadata:
@@ -23,8 +25,10 @@ Use after implementation/integration and before a release candidate is declared 
 8. Construct release evidence and call `ttf_release_gate`.
 
 ## Outcomes
+- `approved`: write the structured `ttf_review` JSON comment, then complete the review card so its children can advance.
 - `release_candidate_ready`: evidence satisfies company policy.
-- `blocked`: return precise failed gates and route repair work to the correct owner.
+- `changes_requested`: write a structured `ttf_review` JSON comment with reviewed commit and actionable findings, then use an untyped/generic block. The transition engine creates the remediation/re-review pair and rewires downstream gates.
+- `blocked`: for a retained policy/capability stop, emit no `changes_requested` verdict and use block kind `needs_input` or `capability`.
 - Production remains a separate human-gated action even when a release candidate is ready.
 
 ## Pitfalls

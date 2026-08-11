@@ -57,7 +57,7 @@ Task Contract
  handoff evidence
 ```
 
-Use Hermes goal-mode cards when a single worker must keep iterating until acceptance criteria are satisfied.
+Use the worker's internal repair loop for code producers, then complete a normal card into an independent reviewer child. Reserve Hermes goal-mode for self-contained orchestration/research cards whose completion does not depend on that downstream review.
 
 ## Graph
 
@@ -76,14 +76,18 @@ Architecture
         │
         ▼
 Engineering Graph Planner (Orchestrator)
-   ┌────┼──────────┐
-   ▼    ▼          ▼
- BE/API FE/UI   Data/Auth ...
-   └────┼──────────┘
-        ▼
-   Integration
-        ▼
- QA + Security
+   ┌────────┼───────────┐
+   ▼        ▼           ▼
+ BE/API   FE/UI      Data/Auth
+   ▼        ▼           ▼
+ Review   Review      Review
+   └────────┼───────────┘
+            ▼
+       Integration
+            ▼
+    Integration Review
+            ▼
+       QA + Security
         ▼
  Release Evidence
         ▼

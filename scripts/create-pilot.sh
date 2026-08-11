@@ -40,7 +40,7 @@ hermes kanban boards create "$BOARD" \
 # one shared checkout.
 hermes kanban boards set-default-workdir "$BOARD" "$PROJECT_DIR"
 
-ROOT_BODY=$(cat <<'BODY'
+IFS= read -r -d '' ROOT_BODY <<'BODY' || true
 You are the ThinkToFinish company orchestrator. Your job on this card is to PLAN AND DISPATCH the project graph, not to implement production code.
 
 Business goal:
@@ -63,7 +63,7 @@ Company constraints:
 - Create stable requirement IDs before implementation.
 - Producer and independent reviewer must be separate roles.
 - Engineering work uses the board-linked Git project/worktrees and PRs; never push directly to main.
-- Engineering tasks use goal_mode when iterative implementation/verification is needed.
+- Engineering producer tasks use normal Kanban cards, not goal_mode. Each producer must have a pre-created independent `qa-reviewer` child; the producer's terminal outcome is a verified `review-required:` commit handoff.
 - Production deployment, destructive migrations, credentials, paid services, major scope changes, production DB writes, and security exceptions require human approval.
 - Direct push to main, bypassing review, disabling security controls, and exposing credentials are forbidden.
 
@@ -71,18 +71,17 @@ Required orchestration pattern:
 1. Create a Product Discovery / Product Spec card assigned to `product`, goal_mode=true. It must produce stable requirement IDs and explicit acceptance criteria, and record requirement traceability nodes.
 2. Create an Architecture Contract card assigned to `architect`, parented on the Product card, goal_mode=true. It must produce ADRs, API/data/security boundaries, and a verification plan.
 3. Create a second orchestrator card assigned to `orchestrator`, parented on the Architecture card, goal_mode=true, titled roughly "Plan and dispatch Mini HRMS engineering DAG". Its body must instruct that future orchestrator to read Product + Architecture handoffs and then create the concrete engineering graph, including:
-   - 2-4 parallelizable implementation cards assigned to `engineer` where architecture permits;
-   - an integration card gated on all implementation cards;
-   - independent QA/security card assigned to `qa-reviewer` gated on integration;
+   - 2-4 parallelizable implementation cards assigned to `engineer` where architecture permits, each with a pre-created read-only `qa-reviewer` child;
+   - an integration card gated on approved implementation reviews, with its own pre-created read-only `qa-reviewer` child;
+   - independent QA/security card assigned to `qa-reviewer` gated on the approved integration-review child, never on the integration producer directly;
    - release-evidence card assigned to `release-manager` gated on QA/security;
    - final company closeout card assigned to `orchestrator` gated on release evidence.
-   Every implementation card must include a Company Task Contract (goal, inputs, outputs, acceptance criteria, verification, risk, assignee, review/security, requirement IDs). Engineering cards must use goal_mode=true.
+   Every implementation card must include a Company Task Contract (goal, inputs, outputs, acceptance criteria, verification, risk, assignee, review/security, requirement IDs). Engineering producer cards must use goal_mode=false and state that `review-required:` is the handoff completion, not a block.
 4. The final company closeout must check requirement coverage and release evidence using ThinkToFinish tools. It may declare only Release Candidate readiness; production remains human-gated.
 5. Complete this kickoff card after those three cards and dependencies have been created. Include the created card IDs in `created_cards` and summarize the graph.
 
 Do not implement the HRMS on this kickoff card. The Definition of Done for this card is a correctly staged project graph that can proceed without further prompting.
 BODY
-)
 
 hermes kanban create "Orchestrate Mini HRMS to Release Candidate" \
   --assignee orchestrator \
@@ -95,6 +94,6 @@ echo
 echo "ThinkToFinish pilot kickoff created on board: $BOARD"
 echo "Project directory: $PROJECT_DIR"
 echo "Board default workdir: $PROJECT_DIR"
-echo "Keep/start gateway: hermes gateway start"
+echo "Keep/start gateway: hermes -p orchestrator gateway start"
 echo "Open dashboard: hermes dashboard"
 echo "The orchestrator kickoff should create Product → Architecture → governed Engineering DAG automatically."

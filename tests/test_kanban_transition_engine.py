@@ -1,0 +1,3872 @@
+import json
+import os
+import runpy
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).parents[1]
+ENGINE = runpy.run_path(str(ROOT / "scripts" / "kanban-transition-engine.py"))
+REAL_WORKSPACE_HEAD = ENGINE["workspace_head"]
+REAL_RESOLVE_REVIEWED_COMMIT = ENGINE["resolve_reviewed_commit"]
+VERDICT = '{"ttf_review":{"decision":"changes_requested","reviewed_commit":"abc1234","findings":["Add a regression test"]}}'
+APPROVED = '{"ttf_review":{"decision":"approved","reviewed_commit":"abc1234","findings":[]}}'
+
+
+@pytest.fixture(autouse=True)
+def stable_test_head(monkeypatch):
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "abc1234")
+    monkeypatch.setitem(
+        ENGINE["transition_plan"].__globals__,
+        "resolve_reviewed_commit",
+        lambda task_id, path, commit: commit,
+    )
+
+
+def make_board(tmp_path, board="demo"):
+    home = tmp_path / "hermes"
+    workspace = home / "worktree"
+    workspace.mkdir(parents=True)
+    subprocess.run(["git", "init", str(workspace)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(workspace), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    db_path = home / "kanban" / "boards" / board / "kanban.db"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT, body TEXT, status TEXT, assignee TEXT,
+                priority INTEGER DEFAULT 0, created_by TEXT, created_at INTEGER NOT NULL DEFAULT 0,
+                workspace_kind TEXT, workspace_path TEXT, tenant TEXT, idempotency_key TEXT,
+                block_kind TEXT, block_recurrences INTEGER NOT NULL DEFAULT 0,
+                claim_lock TEXT, claim_expires INTEGER, worker_pid INTEGER,
+                current_run_id INTEGER
+            );
+            CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+            CREATE TABLE task_comments (
+                id INTEGER PRIMARY KEY, task_id TEXT, author TEXT NOT NULL, body TEXT
+            );
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER
+            );
+            CREATE TABLE kanban_notify_subs (
+                task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '', user_id TEXT, notifier_profile TEXT,
+                created_at INTEGER NOT NULL, last_event_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (task_id, platform, chat_id, thread_id)
+            );
+            """
+        )
+    return home, db_path, workspace
+
+
+def add_cron_job(home, job_id, name, profile="orchestrator", **overrides):
+    profile_home = home if profile == "default" else home / "profiles" / profile
+    jobs_path = profile_home / "cron" / "jobs.json"
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.loads(jobs_path.read_text(encoding="utf-8")) if jobs_path.exists() else {"jobs": []}
+    job = {
+        "id": job_id,
+        "name": name,
+        "schedule": {"kind": "interval", "minutes": 17, "display": "every 17m"},
+        "schedule_display": "every 17m",
+        "repeat": {"times": 7, "completed": 2},
+        "script": "old-engine.py",
+        "no_agent": False,
+        "enabled": True,
+        "state": "scheduled",
+    }
+    job.update(overrides)
+    payload["jobs"].append(job)
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def add_tasks(db_path, tasks, links=(), comments=()):
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO tasks(id, status, assignee, workspace_kind, workspace_path, tenant, "
+            "idempotency_key, block_kind, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tasks,
+        )
+        conn.executemany("INSERT INTO task_links VALUES (?, ?)", links)
+        for task, body in comments:
+            row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task,)).fetchone()
+            conn.execute(
+                "INSERT INTO task_comments(task_id, author, body) VALUES (?, ?, ?)",
+                (task, row[0] if row and row[0] else "unknown", body),
+            )
+
+
+def transition_rows(conn, review_id):
+    remediation = conn.execute(
+        "SELECT * FROM tasks WHERE idempotency_key LIKE ?", (f"ttf-remediation-{review_id}-%",)
+    ).fetchone()
+    rereview = conn.execute(
+        "SELECT * FROM tasks WHERE idempotency_key LIKE ?", (f"ttf-rereview-{review_id}-%",)
+    ).fetchone()
+    return remediation, rereview
+
+
+def test_mixed_reviewer_chain_is_rewired_atomically_with_full_context(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), "tenant-a", None, None, "full contract"),
+            ("t_irev", "done", "code-reviewer", "worktree", str(workspace), "tenant-a", None, None, None),
+            ("t_deeprev", "done", "privacy-reviewer", "worktree", str(workspace), "tenant-a", None, None, None),
+            ("t_qa", "blocked", "safety-reviewer", "worktree", str(workspace), "tenant-a", None, None, None),
+            ("t_next", "todo", "release-manager", "worktree", str(workspace), "tenant-a", None, None, None),
+        ],
+        [
+            ("t_prod", "t_irev"),
+            ("t_irev", "t_deeprev"),
+            ("t_deeprev", "t_qa"),
+            ("t_deeprev", "t_next"),
+            ("t_qa", "t_next"),
+        ],
+        [("t_irev", APPROVED), ("t_deeprev", APPROVED), ("t_qa", VERDICT)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES "
+            "('t_deeprev', 'privacy-reviewer', 'later audit note')"
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at) "
+            "VALUES ('t_qa', 'telegram', 'chat-1', '', 'owner-1', 'orchestrator', 1)"
+        )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_qa-%'"
+        ).fetchone()
+        rereview = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_qa-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_qa-peer-%'"
+        ).fetchone()
+        ancestor_refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_qa-peer-t_deeprev-%'"
+        ).fetchone()
+        links = {tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")}
+        assert result == [f"remediated t_qa -> {remediation['id']} -> {rereview['id']}"]
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_qa'").fetchone()[0] == "archived"
+        assert remediation["status"] == "ready" and remediation["assignee"] == "engineer"
+        assert remediation["tenant"] == "tenant-a" and remediation["workspace_kind"] == "dir"
+        assert remediation["workspace_path"] == str(workspace)
+        assert remediation["created_by"] == rereview["created_by"] == "ttf-transition-engine"
+        assert "Original producer task: `t_prod`" in remediation["body"]
+        assert "verify the checkout is clean and `HEAD` is `abc1234`" in remediation["body"]
+        assert rereview["status"] == "todo" and rereview["assignee"] == "safety-reviewer"
+        assert {("t_prod", remediation["id"]), ("t_qa", remediation["id"])} <= links
+        assert (remediation["id"], rereview["id"]) in links
+        assert (rereview["id"], "t_next") in links and ("t_qa", "t_next") not in links
+        assert ancestor_refresh["status"] == "todo"
+        assert (remediation["id"], ancestor_refresh["id"]) in links
+        assert (ancestor_refresh["id"], "t_next") in links
+        assert ("t_deeprev", "t_next") not in links
+        assert ("t_irev", "t_deeprev") in links
+        assert ("t_deeprev", "t_qa") in links
+        assert (ancestor_refresh["id"], "t_qa") not in links
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='archived'").fetchone()[0] == 1
+        notified = {
+            row[0]
+            for row in conn.execute(
+                "SELECT task_id FROM kanban_notify_subs WHERE platform='telegram' AND chat_id='chat-1'"
+            )
+        }
+        assert {
+            "t_qa", remediation["id"], rereview["id"], ancestor_refresh["id"], "t_next"
+        } <= notified
+
+
+def test_nested_sibling_approval_is_refreshed_without_cycle(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_arch", "done", "architect", "worktree", str(workspace), None, None, None, None),
+            ("t_branch_review", "done", "compliance", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "todo", "release", "worktree", str(workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_arch"),
+            ("t_arch", "t_branch_review"),
+            ("t_branch_review", "t_security"),
+            ("t_arch", "t_review"),
+            ("t_security", "t_release"),
+            ("t_review", "t_release"),
+        ],
+        [
+            ("t_arch", APPROVED),
+            ("t_branch_review", APPROVED),
+            ("t_security", APPROVED),
+            ("t_review", VERDICT),
+        ],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review-%'"
+        ).fetchone()
+        main = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()
+        peer = conn.execute(
+            "SELECT * FROM tasks WHERE "
+            "idempotency_key LIKE 'ttf-rereview-t_review-peer-t_security-%'"
+        ).fetchone()
+        links = {tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")}
+        cycle = conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone()
+        assert result == [f"remediated t_review -> {remediation['id']} -> {main['id']}"]
+        assert ("t_arch", "t_branch_review") in links and ("t_arch", "t_review") in links
+        assert ("t_branch_review", "t_security") in links
+        assert (remediation["id"], peer["id"]) in links
+        assert (peer["id"], "t_release") in links
+        assert (main["id"], "t_release") in links
+        assert ("t_security", "t_release") not in links
+        assert ("t_review", "t_release") not in links
+        assert cycle is None
+
+
+def test_approval_discovery_does_not_cross_nonreview_branch(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_unrelated", "done", "builder", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_side", "blocked", "release", "worktree", str(workspace), None, None, "needs_input", None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_unrelated"),
+            ("t_unrelated", "t_security"),
+            ("t_security", "t_side"),
+            ("t_prod", "t_review"),
+        ],
+        [("t_security", APPROVED), ("t_review", VERDICT)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    assert len(result) == 1 and result[0].startswith("remediated t_review -> ")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_security' AND child_id='t_side'"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("side_workspace_kind", ["worktree", "scratch"])
+def test_active_regated_nested_branch_defers_for_any_workspace(
+    tmp_path, monkeypatch, side_workspace_kind
+):
+    home, db_path, workspace = make_board(tmp_path)
+    side_workspace = None
+    if side_workspace_kind == "worktree":
+        other_workspace = tmp_path / "other-worktree"
+        subprocess.run(["git", "init", str(other_workspace)], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git", "-C", str(other_workspace), "-c", "user.name=Test",
+                "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        side_workspace = str(other_workspace)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_approval", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_active_side", "running", "builder", side_workspace_kind, side_workspace,
+                None, None, None, None,
+            ),
+        ],
+        [
+            ("t_prod", "t_approval"),
+            ("t_approval", "t_review"),
+            ("t_approval", "t_active_side"),
+        ],
+        [("t_approval", APPROVED), ("t_review", VERDICT)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET current_run_id=17 WHERE id='t_active_side'")
+
+    def unexpected_head(_task):
+        raise AssertionError("an active child that would be re-gated must defer before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review'").fetchone()[0] == "blocked"
+        assert conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id='t_active_side'"
+        ).fetchone() == ("running", 17)
+        assert {
+            tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")
+        } == {
+            ("t_prod", "t_approval"),
+            ("t_approval", "t_review"),
+            ("t_approval", "t_active_side"),
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_by='ttf-transition-engine'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("sibling_status", ["done", "archived"])
+def test_remediation_refreshes_terminal_approved_sibling_side_gate(tmp_path, sibling_status):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), "tenant-a", None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), "tenant-a", None, None, None),
+            ("t_security", sibling_status, "security", "worktree", str(workspace), "tenant-a", None, None, None),
+            ("t_release", "todo", "release", "worktree", str(workspace), "tenant-a", None, None, None),
+            (
+                "t_security_release", "ready", "security-release", "worktree", str(workspace),
+                "tenant-a", None, None, None,
+            ),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_security"),
+            ("t_review", "t_release"),
+            ("t_security", "t_security_release"),
+        ],
+        [("t_review", VERDICT), ("t_security", APPROVED)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at) "
+            "VALUES ('t_security', 'telegram', 'security-chat', '', 'security-owner', 'orchestrator', 1)"
+        )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review-%'"
+        ).fetchone()
+        follow_up = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()
+        peer = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-t_security-%'"
+        ).fetchone()
+        links = {tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")}
+        assert result == [f"remediated t_review -> {remediation['id']} -> {follow_up['id']}"]
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_security'").fetchone()[0] == sibling_status
+        assert peer["status"] == "todo" and peer["assignee"] == "security"
+        assert peer["tenant"] == "tenant-a" and peer["workspace_path"] == str(workspace)
+        assert "approval `t_security`" in peer["body"]
+        assert "baseline `abc1234`" in peer["body"]
+        assert (remediation["id"], peer["id"]) in links
+        assert (follow_up["id"], "t_release") in links
+        assert (peer["id"], "t_security_release") in links
+        assert ("t_review", "t_release") not in links
+        assert ("t_security", "t_security_release") not in links
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id='t_security_release'"
+        ).fetchone()[0] == "todo"
+        notified = {
+            row[0]
+            for row in conn.execute(
+                "SELECT task_id FROM kanban_notify_subs "
+                "WHERE platform='telegram' AND chat_id='security-chat'"
+            )
+        }
+        assert {"t_security", peer["id"], "t_security_release"} <= notified
+
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()[0] == 1
+
+
+def test_ordinary_terminal_sibling_without_verdict_is_ignored(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_sibling", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "blocked", "release", "worktree", str(workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_sibling"),
+            ("t_review", "t_release"),
+            ("t_sibling", "t_release"),
+        ],
+        [("t_review", VERDICT)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    with sqlite3.connect(db_path) as conn:
+        assert len(result) == 1 and result[0].startswith("remediated t_review -> ")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_sibling' AND child_id='t_release'"
+        ).fetchone()[0] == 1
+
+
+def test_terminal_ordinary_side_path_gets_peer_refresh_and_owner_gate(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_privacy", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_integration", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_privacy_integration", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_build", "archived", "builder", "scratch", None, None, None, None, None),
+            ("t_release", "ready", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_security"),
+            ("t_prod", "t_privacy"),
+            ("t_security", "t_integration"),
+            ("t_privacy", "t_privacy_integration"),
+            ("t_integration", "t_build"),
+            ("t_privacy_integration", "t_build"),
+            ("t_build", "t_release"),
+        ],
+        [("t_review", VERDICT), ("t_security", APPROVED), ("t_privacy", APPROVED)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at) "
+            "VALUES ('t_security', 'telegram', 'sidepath-chat', '', 'owner', 'orchestrator', 1)"
+        )
+
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        remediation = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review-%'"
+        ).fetchone()
+        follow_up = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()
+        peer = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-rereview-t_review-peer-t_security-%'"
+        ).fetchone()
+        privacy_peer = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-rereview-t_review-peer-t_privacy-%'"
+        ).fetchone()
+        gate = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-review-gate-t_review-replay-%'"
+        ).fetchone()
+        links = {tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")}
+        gate_parents = {
+            row[0] for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (gate["id"],))
+        }
+        assert result == [f"remediated t_review -> {remediation['id']} -> {follow_up['id']}"]
+        assert peer["status"] == "todo" and peer["assignee"] == "security"
+        assert gate["status"] == "blocked" and gate["block_kind"] == "needs_input"
+        assert gate["assignee"] == "ops-owner"
+        assert gate_parents == {follow_up["id"], peer["id"], privacy_peer["id"], "t_build"}
+        assert ("t_security", "t_integration") in links
+        assert ("t_integration", "t_build") in links
+        assert ("t_privacy_integration", "t_build") in links
+        assert ("t_build", "t_release") in links
+        assert (gate["id"], "t_release") in links
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_release'").fetchone()[0] == "todo"
+        assert "`t_integration` -> `t_build` -> `t_release`" in gate["body"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id=? AND chat_id='sidepath-chat'",
+            (gate["id"],),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs "
+            "WHERE task_id='t_release' AND chat_id='sidepath-chat'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone() is None
+
+    assert ENGINE["reconcile"]("demo", str(home), False, "ops-owner") == []
+
+
+def test_active_terminal_ordinary_frontier_defers_before_head_probe(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_release", "running", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_security"),
+            ("t_security", "t_build"),
+            ("t_build", "t_release"),
+        ],
+        [("t_review", VERDICT), ("t_security", APPROVED)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET current_run_id=19 WHERE id='t_release'")
+
+    def unexpected_head(_task):
+        raise AssertionError("active indirect frontier must defer before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id='t_release'"
+        ).fetchone() == ("running", 19)
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review'").fetchone()[0] == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_by='ttf-transition-engine'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_build' AND child_id='t_release'"
+        ).fetchone()[0] == 1
+
+
+def test_active_direct_downstream_defers_before_head_probe(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_active", "running", "builder", "scratch", None, None, None, None, None),
+        ],
+        [("t_prod", "t_review"), ("t_review", "t_active")],
+        [("t_review", VERDICT)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE tasks SET current_run_id=7, claim_lock='claimed', worker_pid=99 "
+            "WHERE id='t_active'"
+        )
+
+    def unexpected_head(_task):
+        raise AssertionError("active direct downstream must defer before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id='t_active'"
+        ).fetchone() == ("running", 7, "claimed", 99)
+        assert {tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")} == {
+            ("t_prod", "t_review"),
+            ("t_review", "t_active"),
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_by='ttf-transition-engine'"
+        ).fetchone()[0] == 0
+
+
+def test_terminal_approval_that_is_also_review_descendant_is_refreshed(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "ready", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_review", "t_security"),
+            ("t_security", "t_release"),
+        ],
+        [("t_review", VERDICT), ("t_security", APPROVED)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        remediation = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review-%'"
+        ).fetchone()[0]
+        peer = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-rereview-t_review-peer-t_security-%'"
+        ).fetchone()[0]
+        assert len(result) == 1 and result[0].startswith("remediated t_review -> ")
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_release'").fetchone()[0] == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_release'",
+            (peer,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (remediation, peer),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_security' AND child_id='t_release'"
+        ).fetchone()[0] == 0
+
+
+def test_archived_producer_is_a_completed_handoff(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "archived", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        remediation, rereview = transition_rows(conn, "t_review")
+        assert result == [f"remediated t_review -> {remediation[0]} -> {rereview[0]}"]
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_prod'").fetchone()[0] == "archived"
+
+
+def test_mixed_terminal_descendant_path_refreshes_every_approval(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_privacy", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "ready", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_review", "t_security"),
+            ("t_security", "t_build"),
+            ("t_build", "t_privacy"),
+            ("t_privacy", "t_release"),
+        ],
+        [("t_review", VERDICT), ("t_security", APPROVED), ("t_privacy", APPROVED)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+
+    with sqlite3.connect(db_path) as conn:
+        remediation = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review-%'"
+        ).fetchone()[0]
+        follow_up = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()[0]
+        peers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-%'"
+            )
+        }
+        gate = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_review-replay-%'"
+        ).fetchone()[0]
+        parents = {
+            row[0]
+            for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id='t_release'"
+            )
+        }
+        assert result == [f"remediated t_review -> {remediation} -> {follow_up}"]
+        assert len(peers) == 2
+        assert parents == {follow_up, gate, *peers}
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_release'").fetchone()[0] == "todo"
+        assert conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone() is None
+    assert ENGINE["reconcile"]("demo", str(home), False, "ops-owner") == []
+
+
+def test_terminal_descendant_diamond_refreshes_every_approval(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_privacy", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_final_review", "done", "release-reviewer", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "ready", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_review", "t_security"),
+            ("t_review", "t_privacy"),
+            ("t_security", "t_final_review"),
+            ("t_privacy", "t_final_review"),
+            ("t_final_review", "t_release"),
+        ],
+        [
+            ("t_review", VERDICT),
+            ("t_security", APPROVED),
+            ("t_privacy", APPROVED),
+            ("t_final_review", APPROVED),
+        ],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        follow_up = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-rereview-t_review-peer-%'"
+        ).fetchone()[0]
+        peers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-rereview-t_review-peer-%'"
+            )
+        }
+        parents = {
+            row[0]
+            for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id='t_release'")
+        }
+        assert len(result) == 1 and result[0].startswith("remediated t_review -> ")
+        assert len(peers) == 3
+        assert parents == {follow_up, *peers}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_review-replay-%'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone() is None
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_terminal_descendant_frontier_aggregation_is_bounded(tmp_path):
+    _, db_path, workspace = make_board(tmp_path)
+    tasks = [("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None)]
+    comments = []
+    layers = []
+    for layer in range(20):
+        nodes = (f"t_layer{layer}a", f"t_layer{layer}b")
+        layers.append(nodes)
+        tasks.extend(
+            (node, "done", "reviewer", "worktree", str(workspace), None, None, None, None)
+            for node in nodes
+        )
+        comments.extend((node, APPROVED) for node in nodes)
+    tasks.append(("t_live", "blocked", "release", "scratch", None, None, None, "needs_input", None))
+    links = [("t_review", node) for node in layers[0]]
+    for parents, children in zip(layers, layers[1:]):
+        links.extend((parent, child) for parent in parents for child in children)
+    links.extend((parent, "t_live") for parent in layers[-1])
+    add_tasks(db_path, tasks, links, comments)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        frontiers = ENGINE["terminal_descendant_frontiers"](conn, "t_review")
+
+    assert len(frontiers) == 2
+    assert {approval for frontier in frontiers for approval in frontier.approval_ids} == {
+        node for layer in layers for node in layer
+    }
+    assert all(not frontier.needs_replay for frontier in frontiers)
+
+
+def test_stale_refresh_gates_terminal_descendant_frontiers(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_stale_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_approval", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_terminal", "archived", "builder", "scratch", None, None, None, None, None),
+            ("t_review_live", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+            ("t_stale_live", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+            ("t_replay_live", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_security"),
+            ("t_review", "t_security"),
+            ("t_security", "t_review_live"),
+            ("t_review", "t_stale_security"),
+            ("t_stale_security", "t_stale_live"),
+            ("t_prod", "t_approval"),
+            ("t_approval", "t_build"),
+            ("t_build", "t_terminal"),
+            ("t_review", "t_terminal"),
+            ("t_terminal", "t_replay_live"),
+        ],
+        [
+            ("t_review", VERDICT),
+            ("t_security", APPROVED.replace("abc1234", "def5678")),
+            ("t_stale_security", APPROVED),
+            ("t_approval", APPROVED.replace("abc1234", "def5678")),
+        ],
+    )
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+
+    with sqlite3.connect(db_path) as conn:
+        refresh = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()[0]
+        replay_gate = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_review-replay-%'"
+        ).fetchone()[0]
+        stale_peer = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-refresh-review-t_review-peer-t_stale_security-%'"
+        ).fetchone()[0]
+        assert result == [f"refreshed stale review t_review -> {refresh} at def5678"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-refresh-review-t_review-peer-t_security-%'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_review_live'",
+            (refresh,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_replay_live'",
+            (replay_gate,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_stale_live'",
+            (stale_peer,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_stale_security' "
+            "AND child_id='t_stale_live'"
+        ).fetchone()[0] == 0
+        conn.execute(
+            "UPDATE tasks SET status='ready', block_kind=NULL "
+            "WHERE id IN ('t_review_live', 't_stale_live', 't_replay_live')"
+        )
+        for child in ("t_review_live", "t_stale_live", "t_replay_live"):
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                "WHERE l.child_id=? AND p.status NOT IN ('done', 'archived')",
+                (child,),
+            ).fetchone()[0] >= 1
+
+
+def test_stale_terminal_descendant_diamond_refreshes_every_approval(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_privacy", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_final_review", "done", "release-reviewer", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_review", "t_security"),
+            ("t_review", "t_privacy"),
+            ("t_security", "t_final_review"),
+            ("t_privacy", "t_final_review"),
+            ("t_final_review", "t_release"),
+        ],
+        [
+            ("t_review", VERDICT),
+            ("t_security", APPROVED),
+            ("t_privacy", APPROVED),
+            ("t_final_review", APPROVED),
+        ],
+    )
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        refresh = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()[0]
+        peers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-peer-%'"
+            )
+        }
+        parents = {
+            row[0]
+            for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id='t_release'")
+        }
+        assert result == [f"refreshed stale review t_review -> {refresh} at def5678"]
+        assert len(peers) == 3
+        assert parents == {refresh, *peers}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_final_review' AND child_id='t_release'"
+        ).fetchone()[0] == 0
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+@pytest.mark.parametrize("sibling_status", ["done", "archived"])
+def test_terminal_sibling_review_with_nonapproved_verdict_fails_closed(tmp_path, sibling_status):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_sibling", sibling_status, "security", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "todo", "release", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review"), ("t_prod", "t_sibling"), ("t_sibling", "t_release")],
+        [("t_review", VERDICT), ("t_sibling", VERDICT)],
+    )
+
+    assert ENGINE["reconcile"]("demo", str(home), False) == [
+        "error: t_review: terminal sibling review t_sibling gating live work has a non-approved verdict"
+    ]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review'").fetchone()[0] == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_by='ttf-transition-engine'"
+        ).fetchone()[0] == 0
+
+
+def test_review_payload_parser_is_strict():
+    assert ENGINE["parse_review_verdict"]('{"ttf_review":[]}') is None
+    assert ENGINE["parse_review_verdict"](
+        '{"ttf_review":{"decision":"changes_requested","reviewed_commit":"not-a-sha","findings":["fix"]}}'
+    ) is None
+
+
+def test_verdict_must_be_current_or_immediately_precede_block_comment(tmp_path):
+    _, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None)],
+        comments=[("t_review", VERDICT)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES ('t_review', 'qa', 'BLOCKED: changes requested')"
+        )
+        assert ENGINE["latest_verdict"](conn, "t_review").decision == "changes_requested"
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES ('t_review', 'qa', 'newer operator note')"
+        )
+        assert ENGINE["latest_verdict"](conn, "t_review") is None
+
+
+def test_verdict_author_must_match_reviewer(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES ('t_review', 'engineer', ?)",
+            (VERDICT,),
+        )
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_stale_review_is_planned_for_refresh(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    stale = VERDICT.replace("abc1234", "def5678")
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", stale)],
+    )
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "abc1234")
+    assert ENGINE["reconcile"]("demo", str(home), True) == ["would refresh t_review with 0 downstream tasks"]
+
+
+def test_stale_review_creates_runnable_refresh_for_real_head(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    reviewed_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    verdict = VERDICT.replace("abc1234", reviewed_head)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", verdict)],
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(workspace), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "other remediation",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    current_head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", REAL_WORKSPACE_HEAD)
+    monkeypatch.setitem(
+        ENGINE["transition_plan"].__globals__, "resolve_reviewed_commit", REAL_RESOLVE_REVIEWED_COMMIT
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-%'"
+        ).fetchone()
+        assert result == [f"refreshed stale review t_review -> {refresh['id']} at {current_head}"]
+        assert refresh["status"] == "ready" and refresh["assignee"] == "qa"
+        assert refresh["workspace_path"] == str(workspace)
+
+
+def test_stale_review_refreshes_stale_terminal_approval_side_edges(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "todo", "release", "worktree", str(workspace), None, None, None, None),
+            ("t_security_release", "ready", "release", "worktree", str(workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_security"),
+            ("t_review", "t_release"),
+            ("t_security", "t_security_release"),
+        ],
+        [("t_review", VERDICT), ("t_security", APPROVED)],
+    )
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()
+        peer = conn.execute(
+            "SELECT * FROM tasks WHERE "
+            "idempotency_key LIKE 'ttf-refresh-review-t_review-peer-t_security-%'"
+        ).fetchone()
+        links = {tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")}
+        assert result == [f"refreshed stale review t_review -> {refresh['id']} at def5678"]
+        assert refresh["status"] == peer["status"] == "ready"
+        assert peer["assignee"] == "security"
+        assert "clean checkout is now `def5678`" in peer["body"]
+        assert ("t_review", peer["id"]) in links
+        assert (peer["id"], "t_security_release") in links
+        assert ("t_security", "t_security_release") not in links
+        assert (refresh["id"], "t_release") in links
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id='t_security_release'"
+        ).fetchone()[0] == "todo"
+
+
+def test_stale_review_defers_for_ready_child_of_fresh_peer_approval(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_release", "todo", "release", "worktree", str(workspace), None, None, None, None),
+            ("t_security_release", "ready", "release", "worktree", str(workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_security"),
+            ("t_review", "t_release"),
+            ("t_security", "t_security_release"),
+        ],
+        [
+            ("t_review", VERDICT),
+            ("t_security", APPROVED.replace("abc1234", "def5678")),
+        ],
+    )
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review'").fetchone()[0] == "blocked"
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_security_release'").fetchone()[0] == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_by='ttf-transition-engine'"
+        ).fetchone()[0] == 0
+        conn.execute("UPDATE tasks SET status='done' WHERE id='t_security_release'")
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(result) == 1 and result[0].startswith("refreshed stale review t_review -> ")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE "
+            "idempotency_key LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()[0] == 0
+
+
+def test_stale_review_gates_only_stale_terminal_ordinary_side_path(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_stale", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_stale_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_stale_release", "ready", "release", "scratch", None, None, None, None, None),
+            ("t_fresh", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_fresh_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_fresh_release", "ready", "release", "scratch", None, None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_review"),
+            ("t_prod", "t_stale"),
+            ("t_stale", "t_stale_build"),
+            ("t_stale_build", "t_stale_release"),
+            ("t_prod", "t_fresh"),
+            ("t_fresh", "t_fresh_build"),
+            ("t_fresh_build", "t_fresh_release"),
+        ],
+        [
+            ("t_review", VERDICT),
+            ("t_stale", APPROVED),
+            ("t_fresh", APPROVED.replace("abc1234", "def5678")),
+        ],
+    )
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review'").fetchone()[0] == "blocked"
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_stale_release'").fetchone()[0] == "ready"
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_fresh_release'").fetchone()[0] == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE created_by='ttf-transition-engine'"
+        ).fetchone()[0] == 0
+        conn.execute("UPDATE tasks SET status='done' WHERE id='t_fresh_release'")
+
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review-%' "
+            "AND idempotency_key NOT LIKE 'ttf-refresh-review-t_review-peer-%'"
+        ).fetchone()
+        stale_peer = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-refresh-review-t_review-peer-t_stale-%'"
+        ).fetchone()
+        gate = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-review-gate-t_review-replay-%'"
+        ).fetchone()
+        gate_parents = {
+            row[0] for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (gate["id"],))
+        }
+        assert result == [f"refreshed stale review t_review -> {refresh['id']} at def5678"]
+        assert stale_peer is not None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE "
+            "'ttf-refresh-review-t_review-peer-t_fresh-%'"
+        ).fetchone()[0] == 0
+        assert gate_parents == {refresh["id"], stale_peer["id"], "t_stale_build"}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_stale_release'",
+            (gate["id"],),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE "
+            "parent_id='t_stale_build' AND child_id='t_stale_release'"
+        ).fetchone()[0] == 1
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_stale_release'").fetchone()[0] == "todo"
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_fresh_release'").fetchone()[0] == "done"
+
+
+def test_workspace_head_rejects_tracked_untracked_and_hidden_changes(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": str(repo)}
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "wrong-repository"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "wrong-index"))
+    assert REAL_WORKSPACE_HEAD(producer)
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_INDEX_FILE")
+    tracked.write_text("modified\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="workspace is dirty"):
+        REAL_WORKSPACE_HEAD(producer)
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("not reviewed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="workspace is dirty"):
+        REAL_WORKSPACE_HEAD(producer)
+    (repo / "untracked.txt").unlink()
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--assume-unchanged", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    tracked.write_text("hidden\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="hidden Git index flags"):
+        REAL_WORKSPACE_HEAD(producer)
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--no-assume-unchanged", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    tracked.write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "update-index", "--skip-worktree", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    tracked.write_text("also hidden\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="hidden Git index flags"):
+        REAL_WORKSPACE_HEAD(producer)
+
+
+def test_workspace_requires_git_checkout_root(tmp_path):
+    _, _, workspace = make_board(tmp_path)
+    nested = workspace / "nested"
+    nested.mkdir()
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": str(nested)}
+    with pytest.raises(ValueError, match="workspace must be the Git checkout root"):
+        ENGINE["workspace"](producer)
+
+
+def test_workspace_head_checks_hidden_changes_inside_submodules(tmp_path):
+    child = tmp_path / "child-source"
+    subprocess.run(["git", "init", str(child)], check=True, capture_output=True)
+    child_file = child / "tracked.txt"
+    child_file.write_text("reviewed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(child), "add", "tracked.txt"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(child), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "child",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "protocol.file.allow=always",
+            "submodule", "add", str(child), "child",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "superproject",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo / "child"), "update-index", "--assume-unchanged", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "child" / "tracked.txt").write_text("hidden\n", encoding="utf-8")
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": str(repo)}
+    with pytest.raises(ValueError, match="hidden Git index flags"):
+        REAL_WORKSPACE_HEAD(producer)
+
+
+def test_reviewed_commit_resolution_requires_a_git_object(tmp_path):
+    _, _, workspace = make_board(tmp_path)
+    reviewed = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git", "-C", str(workspace), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "-m", "new head",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "branch", reviewed[:7], "HEAD"],
+        check=True,
+        capture_output=True,
+    )
+    assert REAL_RESOLVE_REVIEWED_COMMIT("t_prod", workspace, reviewed[:7]) == reviewed
+    assert REAL_RESOLVE_REVIEWED_COMMIT("t_prod", workspace, "0000000") is None
+
+
+def test_reviewed_commit_resolution_rejects_ambiguous_objects(tmp_path, monkeypatch):
+    _, _, workspace = make_board(tmp_path)
+
+    def ambiguous(_task_id, _path, *args, input_text=None):
+        assert args == ("rev-parse", "--disambiguate=abc1234") and input_text is None
+        return f"{'a' * 40}\n{'b' * 40}\n"
+
+    monkeypatch.setitem(REAL_RESOLVE_REVIEWED_COMMIT.__globals__, "git_output", ambiguous)
+    assert REAL_RESOLVE_REVIEWED_COMMIT("t_prod", workspace, "abc1234") is None
+
+
+def test_workspace_rejects_relative_persistent_path(tmp_path, monkeypatch):
+    (tmp_path / "relative-worktree").mkdir()
+    monkeypatch.chdir(tmp_path)
+    producer = {"id": "t_prod", "workspace_kind": "worktree", "workspace_path": "relative-worktree"}
+    with pytest.raises(ValueError, match="workspace is unavailable"):
+        ENGINE["workspace"](producer)
+
+
+def test_generated_rereview_can_start_a_second_remediation(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_oldrev", "archived", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_fix1", "done", "engineer", "worktree", str(workspace), None,
+                "ttf-remediation-t_oldrev-digest", None, None,
+            ),
+            ("t_rerev1", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_oldrev"),
+            ("t_prod", "t_fix1"),
+            ("t_oldrev", "t_fix1"),
+            ("t_fix1", "t_rerev1"),
+        ],
+        [("t_oldrev", VERDICT), ("t_rerev1", VERDICT)],
+    )
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        remediation, rereview = transition_rows(conn, "t_rerev1")
+        parents = {row[0] for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (remediation["id"],))}
+        assert result == [f"remediated t_rerev1 -> {remediation['id']} -> {rereview['id']}"]
+        assert parents == {"t_fix1", "t_rerev1"}
+
+
+def test_remediation_depth_ignores_sibling_branch_repairs(tmp_path):
+    _, db_path, workspace = make_board(tmp_path)
+    tasks = [
+        ("t_integration", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+        ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+    ]
+    links = [("t_integration", "t_review")]
+    for index in range(3):
+        fix = f"t_sibling{index}"
+        tasks.append(
+            (
+                fix, "done", "engineer", "worktree", str(workspace), None,
+                f"ttf-remediation-t_branch{index}-digest", None, None,
+            )
+        )
+        links.append((fix, "t_integration"))
+    add_tasks(db_path, tasks, links)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        assert ENGINE["remediation_depth"](conn, "t_review") == 0
+
+
+def test_human_gate_is_not_automated(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, "needs_input", None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_retained_engine_gate_does_not_reserve_the_checkout(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_gate", "blocked", "orchestrator", "dir", str(workspace), None,
+                "ttf-review-gate-t_old-digest", "needs_input", None,
+            ),
+            ("t_gated", "todo", "release", "dir", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review"), ("t_prod", "t_gate"), ("t_gate", "t_gated")],
+        [("t_review", VERDICT)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(result) == 1 and result[0].startswith("remediated t_review -> ")
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_gate'").fetchone()[0] == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_gate' AND child_id='t_gated'"
+        ).fetchone()[0] == 1
+
+
+def test_remediation_cap_routes_to_one_sticky_owner_gate(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    tasks = [("t_root", "done", "engineer", "worktree", str(workspace), None, None, None, None)]
+    links = []
+    comments = []
+    parent = "t_root"
+    for index in range(1, 4):
+        review = f"t_rev{index}"
+        remediation = f"t_fix{index}"
+        tasks.extend(
+            [
+                (review, "archived", "qa", "worktree", str(workspace), None, None, None, None),
+                (
+                    remediation, "done", "engineer", "worktree", str(workspace), None,
+                    f"ttf-remediation-{review}-digest", None, None,
+                ),
+            ]
+        )
+        links.extend(((parent, review), (parent, remediation), (review, remediation)))
+        comments.append((review, VERDICT))
+        parent = remediation
+    tasks.extend(
+        [
+            ("t_final", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_next", "todo", "release", "worktree", str(workspace), None, None, None, None),
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            ("t_side", "ready", "release", "worktree", str(workspace), None, None, None, None),
+            ("t_old_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_deep_side", "ready", "release", "scratch", None, None, None, None, None),
+            ("t_fresh_review", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_fresh_blocked", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+        ]
+    )
+    links.extend(
+        (
+            (parent, "t_final"),
+            ("t_final", "t_next"),
+            (parent, "t_security"),
+            ("t_security", "t_side"),
+            ("t_security", "t_old_build"),
+            ("t_final", "t_old_build"),
+            ("t_old_build", "t_deep_side"),
+            (parent, "t_fresh_review"),
+            ("t_final", "t_fresh_review"),
+            ("t_fresh_review", "t_fresh_blocked"),
+        )
+    )
+    comments.extend(
+        (
+            ("t_final", VERDICT),
+            ("t_security", APPROVED.replace("abc1234", "def5678")),
+            ("t_fresh_review", APPROVED),
+        )
+    )
+    add_tasks(db_path, tasks, links, comments)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at) "
+            "VALUES ('t_final', 'telegram', 'cap-chat', '', 'owner', 'orchestrator', 1)"
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at) "
+            "VALUES ('t_security', 'telegram', 'security-cap-chat', '', 'security-owner', 'orchestrator', 1)"
+        )
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        gate = conn.execute("SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_final-%'").fetchone()
+        parents = {row[0] for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (gate["id"],))}
+        links = {tuple(row) for row in conn.execute("SELECT parent_id, child_id FROM task_links")}
+        assert result == [f"gated t_final -> {gate['id']} after 3 remediation generations"]
+        assert gate["status"] == "blocked" and gate["block_kind"] == "needs_input"
+        assert gate["block_recurrences"] == 1
+        assert gate["assignee"] == "ops-owner" and gate["created_by"] == "ttf-transition-engine"
+        assert parents == {"t_fix3"}
+        assert conn.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id DESC", (gate["id"],)).fetchone()[0] == "blocked"
+        created_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='created'", (gate["id"],)
+        ).fetchone()[0]
+        blocked_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='blocked'", (gate["id"],)
+        ).fetchone()[0]
+        subscription_cursor = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs WHERE task_id=? AND chat_id='cap-chat'", (gate["id"],)
+        ).fetchone()[0]
+        assert subscription_cursor == created_event < blocked_event
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_final'").fetchone()[0] == "archived"
+        assert (gate["id"], "t_next") in links and ("t_final", "t_next") not in links
+        assert (gate["id"], "t_side") in links and ("t_security", "t_side") not in links
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_side'").fetchone()[0] == "todo"
+        assert ("t_old_build", "t_deep_side") in links
+        assert (gate["id"], "t_deep_side") in links
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_deep_side'").fetchone()[0] == "todo"
+        assert ("t_fresh_review", "t_fresh_blocked") in links
+        assert (gate["id"], "t_fresh_blocked") in links
+        assert "`t_old_build` -> `t_deep_side`" in gate["body"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_final-%'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id=? AND chat_id='security-cap-chat'",
+            (gate["id"],),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone() is None
+    assert ENGINE["reconcile"]("demo", str(home), False, "ops-owner") == []
+
+
+def test_stale_refresh_cap_routes_to_owner_gate(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    tasks = [("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None)]
+    links = []
+    comments = []
+    parent = "t_prod"
+    for index in range(4):
+        review = f"t_refresh{index}"
+        key = None if index == 0 else f"ttf-refresh-review-t_refresh{index - 1}-digest"
+        status = "blocked" if index == 3 else "archived"
+        tasks.append((review, status, "qa", "worktree", str(workspace), None, key, None, None))
+        links.append((parent, review))
+        comments.append((review, VERDICT))
+        parent = review
+    tasks.extend(
+        [
+            ("t_security", "done", "security", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_hold", "blocked", "orchestrator", "worktree", str(workspace), None,
+                None, "needs_input", None,
+            ),
+            ("t_side", "todo", "release", "worktree", str(workspace), None, None, None, None),
+            ("t_old_build", "done", "builder", "scratch", None, None, None, None, None),
+            ("t_deep_side", "ready", "release", "scratch", None, None, None, None, None),
+            ("t_next", "todo", "release", "worktree", str(workspace), None, None, None, None),
+            ("t_fresh_review", "done", "privacy", "worktree", str(workspace), None, None, None, None),
+            ("t_fresh_blocked", "blocked", "release", "scratch", None, None, None, "needs_input", None),
+        ]
+    )
+    links.extend(
+        (
+            ("t_prod", "t_security"),
+            ("t_security", "t_side"),
+            ("t_hold", "t_side"),
+            ("t_security", "t_old_build"),
+            (parent, "t_old_build"),
+            ("t_old_build", "t_deep_side"),
+            (parent, "t_next"),
+            ("t_prod", "t_fresh_review"),
+            (parent, "t_fresh_review"),
+            ("t_fresh_review", "t_fresh_blocked"),
+        )
+    )
+    comments.extend(
+        (
+            ("t_security", APPROVED),
+            ("t_fresh_review", APPROVED.replace("abc1234", "def5678")),
+        )
+    )
+    add_tasks(db_path, tasks, links, comments)
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    result = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        gate = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_refresh3-%'"
+        ).fetchone()
+        assert result == [f"gated stale review t_refresh3 -> {gate['id']} after 3 refreshes"]
+        assert gate["status"] == "blocked" and gate["block_kind"] == "needs_input"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_next'", (gate["id"],)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_side'", (gate["id"],)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_security' AND child_id='t_side'"
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_side'").fetchone()[0] == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_old_build' AND child_id='t_deep_side'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_deep_side'",
+            (gate["id"],),
+        ).fetchone()[0] == 1
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_deep_side'").fetchone()[0] == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_fresh_review' "
+            "AND child_id='t_fresh_blocked'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id='t_fresh_blocked'",
+            (gate["id"],),
+        ).fetchone()[0] == 1
+        assert {
+            row[0] for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (gate["id"],))
+        } == {"t_prod"}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-review-gate-t_refresh3-%'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "WITH RECURSIVE reach(start,node) AS ("
+            "SELECT parent_id,child_id FROM task_links UNION "
+            "SELECT reach.start,l.child_id FROM reach JOIN task_links l ON l.parent_id=reach.node) "
+            "SELECT 1 FROM reach WHERE start=node LIMIT 1"
+        ).fetchone() is None
+
+
+def test_stale_refresh_preserves_remediation_generation_cap(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    tasks = [("t_root", "done", "engineer", "worktree", str(workspace), None, None, None, None)]
+    links = []
+    comments = []
+    parent = "t_root"
+    for index in range(1, 4):
+        review = f"t_rev{index}"
+        remediation = f"t_fix{index}"
+        tasks.extend(
+            [
+                (review, "archived", "qa", "worktree", str(workspace), None, None, None, None),
+                (
+                    remediation, "done", "engineer", "worktree", str(workspace), None,
+                    f"ttf-remediation-{review}-digest", None, None,
+                ),
+            ]
+        )
+        links.extend(((parent, review), (parent, remediation), (review, remediation)))
+        comments.append((review, VERDICT))
+        parent = remediation
+    tasks.extend(
+        [
+            ("t_stale", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_next", "todo", "release", "worktree", str(workspace), None, None, None, None),
+        ]
+    )
+    links.extend(((parent, "t_stale"), ("t_stale", "t_next")))
+    comments.append(("t_stale", VERDICT))
+    add_tasks(db_path, tasks, links, comments)
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", lambda task: "def5678")
+
+    first = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+    assert len(first) == 1 and first[0].startswith("refreshed stale review t_stale -> ")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_stale-%'"
+        ).fetchone()
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (refresh["id"],))
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES (?, 'qa', ?)",
+            (refresh["id"], VERDICT.replace("abc1234", "def5678")),
+        )
+
+    second = ENGINE["reconcile"]("demo", str(home), False, "ops-owner")
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        gate = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE ?",
+            (f"ttf-review-gate-{refresh['id']}-%",),
+        ).fetchone()
+        assert second == [f"gated {refresh['id']} -> {gate['id']} after 3 remediation generations"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ?",
+            (f"ttf-remediation-{refresh['id']}-%",),
+        ).fetchone()[0] == 0
+
+
+def test_one_failed_review_does_not_starve_the_next(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    tasks = []
+    links = []
+    comments = []
+    for producer, review, child in (("t_p111", "t_a111", "t_c111"), ("t_p222", "t_b222", "t_c222")):
+        tasks.extend(
+            [
+                (producer, "done", "engineer", "worktree", str(workspace), None, None, None, None),
+                (review, "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+                (child, "todo", "release", "worktree", str(workspace), None, None, None, None),
+            ]
+        )
+        links.extend(((producer, review), (review, child)))
+        comments.append((review, VERDICT))
+    add_tasks(db_path, tasks, links, comments)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET workspace_kind='scratch' WHERE id='t_p111'")
+    result = ENGINE["reconcile"]("demo", str(home), False)
+
+    assert result[0] == "error: t_a111: producer t_p111 has no persistent workspace"
+    assert result[1].startswith("remediated t_b222 -> ")
+
+
+def test_shared_workspace_defers_until_fresh_verdict(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review1", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_review2", "blocked", "security", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review1"), ("t_prod", "t_review2")],
+        [("t_review1", VERDICT), ("t_review2", VERDICT)],
+    )
+    head_checks = 0
+    head = "abc1234"
+
+    def checked_head(task):
+        nonlocal head_checks, head
+        head_checks += 1
+        return head
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", checked_head)
+
+    first = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(first) == 1 and first[0].startswith("remediated t_review1 -> ")
+    assert head_checks == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review2'").fetchone()[0] == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE 'ttf-remediation-t_review2-%'"
+        ).fetchone()[0] == 0
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE idempotency_key LIKE 'ttf-remediation-t_review1-%'"
+        )
+
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    assert head_checks == 1
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE created_by='ttf-transition-engine'")
+
+    head = "def5678"
+    refresh_result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(refresh_result) == 1 and refresh_result[0].startswith("refreshed stale review t_review2 -> ")
+    assert head_checks == 2
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        refresh = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key LIKE 'ttf-refresh-review-t_review2-%'"
+        ).fetchone()
+        assert refresh["status"] == "ready" and refresh["assignee"] == "security"
+        assert "clean checkout is now `def5678`" in refresh["body"]
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review2'").fetchone()[0] == "archived"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id='t_review2' AND child_id=?", (refresh["id"],)
+        ).fetchone()[0] == 1
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (refresh["id"],))
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body) VALUES (?, 'security', ?)",
+            (refresh["id"], VERDICT.replace("abc1234", "def5678")),
+        )
+
+    remediated = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(remediated) == 1 and remediated[0].startswith(f"remediated {refresh['id']} -> ")
+    assert head_checks == 3
+
+
+@pytest.mark.parametrize("status", ["todo", "ready", "running", "review"])
+def test_runnable_sibling_reviewer_defers_before_head_probe(tmp_path, monkeypatch, status):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_rejected", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_sibling", status, "security", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_rejected"), ("t_prod", "t_sibling")],
+        [("t_rejected", VERDICT)],
+    )
+
+    def unexpected_head(_task):
+        raise AssertionError("an executable sibling must reserve the checkout before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_shared_checkout_worker_defers_without_unrelated_task_deadlock(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_rejected", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_other_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_worker", "ready", "developer", "dir", str(workspace), None, None, None, None),
+            ("t_scratch", "running", "researcher", "scratch", None, None, None, None, None),
+            ("t_waiting", "todo", "release", "dir", str(workspace), None, None, None, None),
+            ("t_triage", "triage", "orchestrator", "dir", str(workspace), None, None, None, None),
+            ("t_invalid", "running", "researcher", "dir", str(other_workspace), None, None, None, None),
+        ],
+        [
+            ("t_prod", "t_rejected"),
+            ("t_other_prod", "t_worker"),
+            ("t_prod", "t_waiting"),
+            ("t_rejected", "t_waiting"),
+        ],
+        [("t_rejected", VERDICT)],
+    )
+    head_checks = 0
+
+    def checked_head(_task):
+        nonlocal head_checks
+        head_checks += 1
+        return "abc1234"
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", checked_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+    assert head_checks == 0
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET status='done' WHERE id='t_worker'")
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(result) == 1 and result[0].startswith("remediated t_rejected -> ")
+    assert head_checks == 1
+
+
+def test_dry_run_reserves_one_shared_workspace_lane(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review1", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            ("t_review2", "blocked", "security", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review1"), ("t_prod", "t_review2")],
+        [("t_review1", VERDICT), ("t_review2", VERDICT)],
+    )
+
+    assert ENGINE["reconcile"]("demo", str(home), True) == [
+        "would remediate t_review1 with 0 downstream tasks",
+        "would defer t_review2 because workspace lane is busy",
+    ]
+
+
+def test_legacy_transition_in_same_checkout_defers_before_head_probe(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    nested = workspace / "nested"
+    nested.mkdir()
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_legacy", "running", "engineer", "dir", str(nested), None,
+                "ttf-remediation-t_other", None, None,
+            ),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE tasks SET created_by='orchestrator' WHERE id='t_legacy'")
+
+    def unexpected_head(_task):
+        raise AssertionError("busy lanes must defer before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == []
+
+
+def test_unverifiable_active_transition_fails_closed_before_head_probe(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    not_git = tmp_path / "not-git"
+    not_git.mkdir()
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+            (
+                "t_broken", "running", "engineer", "dir", str(not_git), None,
+                "ttf-remediation-t_other", None, None,
+            ),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+
+    def unexpected_head(_task):
+        raise AssertionError("unverifiable active lanes must fail before probing HEAD")
+
+    monkeypatch.setitem(ENGINE["transition_plan"].__globals__, "workspace_head", unexpected_head)
+    assert ENGINE["reconcile"]("demo", str(home), False) == [
+        "error: t_review: active transition t_broken has an unverifiable workspace"
+    ]
+
+
+def test_unassigned_review_isolated_from_later_work(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod1", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_a_review", "blocked", None, "worktree", str(workspace), None, None, None, None),
+            ("t_prod2", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_b_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod1", "t_a_review"), ("t_prod2", "t_b_review")],
+        [("t_a_review", VERDICT), ("t_b_review", VERDICT)],
+    )
+
+    result = ENGINE["reconcile"]("demo", str(home), False)
+    assert len(result) == 1 and result[0].startswith("remediated t_b_review -> ")
+
+
+def test_atomic_failure_rolls_back_every_transition_write(tmp_path, monkeypatch):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+    original = ENGINE["insert_task"]
+    calls = 0
+
+    def fail_on_second_insert(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        task_id = original(*args, **kwargs)
+        if calls == 2:
+            raise RuntimeError("simulated crash")
+        return task_id
+
+    monkeypatch.setitem(ENGINE["apply_transition"].__globals__, "insert_task", fail_on_second_insert)
+    assert ENGINE["reconcile"]("demo", str(home), False) == ["error: t_review: simulated crash"]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE created_by='ttf-transition-engine'").fetchone()[0] == 0
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review'").fetchone()[0] == "blocked"
+        assert conn.execute("SELECT COUNT(*) FROM task_links WHERE parent_id='t_prod' AND child_id='t_review'").fetchone()[0] == 1
+
+
+def test_conflicting_transition_is_not_reused_or_archived(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+                (
+                    "t_old_fix", "todo", "engineer", "worktree", str(workspace), None,
+                    "ttf-remediation-t_review", None, None,
+                ),
+        ],
+        [("t_prod", "t_review"), ("t_prod", "t_old_fix"), ("t_review", "t_old_fix")],
+        [("t_review", VERDICT)],
+    )
+    assert ENGINE["reconcile"]("demo", str(home), False) == [
+        "error: t_review: review t_review already has an active or conflicting transition"
+    ]
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_old_fix'").fetchone()[0] == "todo"
+        assert conn.execute("SELECT status FROM tasks WHERE id='t_review'").fetchone()[0] == "blocked"
+
+
+def test_ephemeral_producer_workspace_fails_closed(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "scratch", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "scratch", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+    assert ENGINE["reconcile"]("demo", str(home), True) == [
+        "error: t_review: producer t_prod has no persistent workspace"
+    ]
+
+
+def test_board_lock_skips_overlapping_reconcile(tmp_path):
+    home, db_path, _ = make_board(tmp_path)
+    with ENGINE["board_lock"](db_path):
+        assert ENGINE["reconcile"]("demo", str(home), False) == [ENGINE["LOCK_BUSY"]]
+
+
+def test_runtime_errors_are_emitted_once_until_resolved(tmp_path):
+    state = tmp_path / "kanban.db"
+    error = "error: t_review: malformed graph"
+    assert ENGINE["dedupe_runtime_errors"](state, [error]) == [error]
+    assert ENGINE["dedupe_runtime_errors"](state, [error]) == []
+    assert ENGINE["dedupe_runtime_errors"](state, []) == []
+    assert ENGINE["dedupe_runtime_errors"](state, [error]) == [error]
+
+
+def test_deduplicated_runtime_error_keeps_failing_exit_status(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "scratch", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "scratch", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+    command = [
+        sys.executable, str(ROOT / "scripts" / "kanban-transition-engine.py"),
+        "--board", "demo", "--home", str(home),
+    ]
+
+    first = subprocess.run(command, text=True, capture_output=True)
+    second = subprocess.run(command, text=True, capture_output=True)
+    assert first.returncode == second.returncode == 1
+    assert "no persistent workspace" in first.stdout
+    assert second.stdout == ""
+
+
+def test_default_board_path(tmp_path):
+    assert ENGINE["board_db_path"](str(tmp_path), "Default") == tmp_path / "kanban.db"
+
+
+@pytest.mark.parametrize("reserved", ["#", "?"])
+def test_read_only_database_uri_encodes_reserved_path_characters(tmp_path, reserved):
+    scope = tmp_path / f"scope{reserved}tail"
+    home, db_path, workspace = make_board(scope)
+    add_tasks(
+        db_path,
+        [
+            ("t_prod", "done", "engineer", "worktree", str(workspace), None, None, None, None),
+            ("t_review", "blocked", "qa", "worktree", str(workspace), None, None, None, None),
+        ],
+        [("t_prod", "t_review")],
+        [("t_review", VERDICT)],
+    )
+
+    assert ENGINE["reconcile"]("demo", str(home), True) == [
+        "would remediate t_review with 0 downstream tasks"
+    ]
+    assert not (tmp_path / "scope").exists()
+
+
+def test_installer_rejects_missing_board_before_writes(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hermes.chmod(0o755)
+    home = tmp_path / "home"
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+    env.pop("HERMES_KANBAN_DB", None)
+    env.pop("HERMES_KANBAN_HOME", None)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "enable-kanban-autopilot.sh"), "--profile", "default", "missing"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "Kanban board not found" in result.stderr
+    assert not (home / "scripts").exists()
+
+
+@pytest.mark.parametrize("database_source", ["derived-symlink", "explicit-symlink"])
+def test_installer_rejects_concurrent_install_for_same_canonical_board_database(
+    tmp_path, database_source
+):
+    import fcntl
+
+    home, db_path, _ = make_board(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HERMES_TEST_LOG\"\nexit 0\n",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    alias_home = tmp_path / "alias-home"
+    derived_alias = alias_home / "kanban" / "boards" / "demo" / "kanban.db"
+    derived_alias.parent.mkdir(parents=True)
+    derived_alias.symlink_to(db_path)
+    explicit_alias = tmp_path / "explicit-kanban.db"
+    explicit_alias.symlink_to(db_path)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HERMES_HOME": str(home),
+        "HERMES_TEST_LOG": str(log),
+    }
+    env.pop("HERMES_KANBAN_HOME", None)
+    env.pop("HERMES_KANBAN_DB", None)
+    if database_source == "derived-symlink":
+        env["HERMES_KANBAN_HOME"] = str(alias_home)
+    else:
+        env["HERMES_KANBAN_DB"] = str(explicit_alias)
+    lock = Path(f"{db_path}.ttf-install.lock").open("a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            [
+                str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+                "--profile", "developer", "demo",
+            ],
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+    finally:
+        lock.close()
+
+    assert result.returncode == 1
+    assert "already running" in result.stderr
+    assert "cron list" not in log.read_text(encoding="utf-8")
+
+
+def test_installer_requires_explicit_legacy_takeover(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  aaa111 [active]' '    Name:      demo-graph-governor'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "enable-kanban-autopilot.sh"), "--profile", "orchestrator", "demo"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert result.returncode == 1
+    assert "migrate every reviewer" in result.stderr.lower()
+    assert not (home / "profiles" / "orchestrator" / "scripts").exists()
+
+
+def test_installer_snapshot_failure_does_not_mutate_cron(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert "Could not snapshot" in result.stderr
+    assert "cron pause" not in commands and "cron resume" not in commands and "cron edit" not in commands
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    assert not (scripts / "ttf-demo-transition-engine.py").exists()
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+
+
+def test_installer_parks_legacy_and_activates_exact_job(tmp_path):
+    home, db_path, workspace = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    add_cron_job(home, "aaa222", "demo-graph-governor")
+    add_cron_job(home, "ccc333", "ttf-demo-graph-governor", profile="default")
+    # A malformed legacy review must not prevent installing the recovery engine.
+    add_tasks(
+        db_path,
+        [("t_legacy", "blocked", "qa", "worktree", str(workspace), None, None, None, None)],
+        comments=[("t_legacy", VERDICT)],
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' \
+    '  aaa111 [active]' \
+    '    Name:      demo-graph-governor' \
+    '  aaa222 [active]' \
+    '    Name:      demo-graph-governor' \
+    '  bbb222 [active]' \
+    '    Name:      ttf-demo-transition-engine'
+fi
+if [ "$*" = "-p default cron list --all" ]; then
+  printf '%s\n' '  ccc333 [active]' '    Name:      ttf-demo-graph-governor'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HERMES_HOME": str(home),
+        "HERMES_TEST_LOG": str(log),
+    }
+    env.pop("HERMES_KANBAN_DB", None)
+    env.pop("HERMES_KANBAN_HOME", None)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "Orchestrator", "--replace-legacy", "Demo",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stderr
+    assert "cron pause aaa111" not in commands and "cron resume aaa111" not in commands
+    assert "cron pause aaa222" not in commands and "cron resume aaa222" not in commands
+    assert "cron pause ccc333" not in commands and "cron resume ccc333" not in commands
+    assert commands.count("-p orchestrator cron status") >= 4
+    assert "-p default cron status" in commands
+    assert "-p orchestrator cron edit bbb222 --schedule every 1m --script ttf-demo-transition-engine.py --no-agent --repeat 0" in commands
+    assert "--monitor-script  --monitor-url" in commands
+    assert " cron create " not in commands
+    orchestrator_jobs = json.loads(
+        (home / "profiles" / "orchestrator" / "cron" / "jobs.json").read_text(encoding="utf-8")
+    )["jobs"]
+    default_jobs = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8"))["jobs"]
+    parked = {
+        job["id"]: (job["enabled"], job["state"])
+        for job in [*orchestrator_jobs, *default_jobs]
+        if job["id"] in {"aaa111", "aaa222", "ccc333"}
+    }
+    assert parked == {
+        "aaa111": (False, "paused"),
+        "aaa222": (False, "paused"),
+        "ccc333": (False, "paused"),
+    }
+    wrapper = home / "profiles" / "orchestrator" / "scripts" / "ttf-demo-transition-engine.py"
+    core = home / "profiles" / "orchestrator" / "scripts" / "ttf-demo-transition-engine-core.py"
+    wrapper_text = wrapper.read_text(encoding="utf-8")
+    assert core.read_bytes() == (ROOT / "scripts" / "kanban-transition-engine.py").read_bytes()
+    assert str(core) in wrapper_text
+    assert "sys.executable" in wrapper_text
+    assert "'--owner-profile', 'orchestrator'" in wrapper_text
+    assert f"os.environ['HERMES_KANBAN_DB'] = '{db_path}'" in wrapper_text
+    assert "HERMES_KANBAN_TASK" in wrapper_text and "os.environ.pop" in wrapper_text
+    assert list(wrapper.parent.glob(".ttf-demo-engine-rollback.*")) == []
+
+
+def test_installer_parks_legacy_before_fresh_replacement_create(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    legacy_paused = tmp_path / "legacy-paused"
+    replacement_active = tmp_path / "replacement-active"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  legacy=active; [ -f "$HERMES_TEST_LEGACY_PAUSED" ] && legacy=paused
+  printf '%s\n' "  aaa111 [$legacy]" '    Name:      demo-graph-governor'
+  if [ -f "$HERMES_TEST_REPLACEMENT_ACTIVE" ]; then
+    printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+  fi
+fi
+case "$*" in
+  "-p orchestrator cron create --name ttf-demo-transition-engine-install-"*" --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m")
+  python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+job = next(job for job in json.load(open(sys.argv[1], encoding="utf-8"))["jobs"] if job["id"] == "aaa111")
+assert job["enabled"] is False and job["state"] == "paused"
+PY
+    : > "$HERMES_TEST_LEGACY_PAUSED"
+    : > "$HERMES_TEST_REPLACEMENT_ACTIVE"
+    printf '%s\n' 'Created job: bbb222' ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(home / "profiles" / "orchestrator" / "cron" / "jobs.json"),
+            "HERMES_TEST_LEGACY_PAUSED": str(legacy_paused),
+            "HERMES_TEST_REPLACEMENT_ACTIVE": str(replacement_active),
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8").splitlines()
+    assert result.returncode == 0, result.stderr
+    create_index = next(i for i, line in enumerate(commands) if "cron create --name" in line)
+    status_index = max(
+        i for i, line in enumerate(commands[:create_index]) if line == "-p orchestrator cron status"
+    )
+    assert status_index < create_index
+    assert any("--name ttf-demo-transition-engine-install-" in line for line in commands)
+    assert "-p orchestrator cron edit bbb222 --name ttf-demo-transition-engine" in commands
+    legacy = json.loads(
+        (home / "profiles" / "orchestrator" / "cron" / "jobs.json").read_text(encoding="utf-8")
+    )["jobs"][0]
+    assert legacy["enabled"] is False and legacy["state"] == "paused"
+
+
+def test_installer_keeps_its_created_job_when_same_name_job_races(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    created = tmp_path / "created"
+    competitor_paused = tmp_path / "competitor-paused"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  aaa111 [active]' '    Name:      demo-graph-governor'
+  if [ -f "$HERMES_TEST_CREATED" ]; then
+    [ -f "$HERMES_TEST_COMPETITOR_PAUSED" ] || \
+      printf '%s\n' '  ccc333 [active]' '    Name:      ttf-demo-transition-engine'
+    printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+  fi
+fi
+case "$*" in
+  "-p orchestrator cron create --name ttf-demo-transition-engine-install-"*" --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m")
+    python3 - "$HERMES_TEST_JOBS" "$6" <<'PY'
+import copy, json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+template = payload["jobs"][0]
+for job_id, name in (("ccc333", "ttf-demo-transition-engine"), ("bbb222", sys.argv[2])):
+    job = copy.deepcopy(template)
+    job.update({"id": job_id, "name": name, "enabled": True, "state": "scheduled"})
+    job.pop("paused_at", None)
+    job.pop("paused_reason", None)
+    payload["jobs"].append(job)
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    : > "$HERMES_TEST_CREATED"
+    printf '%s\n' 'Created job: bbb222' ;;
+  "-p orchestrator cron edit bbb222 --name ttf-demo-transition-engine")
+    python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+next(job for job in payload["jobs"] if job["id"] == "bbb222")["name"] = "ttf-demo-transition-engine"
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    ;;
+esac
+if [ "$*" = "-p orchestrator cron status" ] && python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+raise SystemExit(not any(job.get("id") == "ccc333" and job.get("state") == "paused" for job in jobs))
+PY
+then
+  : > "$HERMES_TEST_COMPETITOR_PAUSED"
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(home / "profiles" / "orchestrator" / "cron" / "jobs.json"),
+            "HERMES_TEST_CREATED": str(created),
+            "HERMES_TEST_COMPETITOR_PAUSED": str(competitor_paused),
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stderr
+    assert competitor_paused.is_file()
+    assert "cron pause ccc333" not in commands and "cron pause bbb222" not in commands
+    assert "-p orchestrator cron edit bbb222 --name ttf-demo-transition-engine" in commands
+    jobs = {
+        job["id"]: job
+        for job in json.loads(
+            (home / "profiles" / "orchestrator" / "cron" / "jobs.json").read_text(encoding="utf-8")
+        )["jobs"]
+    }
+    assert jobs["ccc333"]["enabled"] is False and jobs["ccc333"]["state"] == "paused"
+    assert jobs["bbb222"]["enabled"] is True and jobs["bbb222"]["state"] == "scheduled"
+
+
+def test_installer_keeps_engine_copies_isolated_per_board(tmp_path):
+    home, demo_db, _ = make_board(tmp_path)
+    add_cron_job(home, "aaa111", "ttf-demo-transition-engine")
+    add_cron_job(home, "bbb222", "ttf-other-transition-engine")
+    other_db = home / "kanban" / "boards" / "other" / "kanban.db"
+    other_db.parent.mkdir(parents=True)
+    with sqlite3.connect(demo_db) as source, sqlite3.connect(other_db) as destination:
+        source.backup(destination)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' \
+    '  aaa111 [active]' '    Name:      ttf-demo-transition-engine' \
+    '  bbb222 [active]' '    Name:      ttf-other-transition-engine'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_TASK"):
+        env.pop(key, None)
+    installer = str(ROOT / "scripts" / "enable-kanban-autopilot.sh")
+
+    first = subprocess.run(
+        [installer, "--profile", "orchestrator", "demo"], text=True, capture_output=True, env=env
+    )
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    demo_core = scripts / "ttf-demo-transition-engine-core.py"
+    demo_wrapper = scripts / "ttf-demo-transition-engine.py"
+    assert first.returncode == 0, first.stderr
+    assert demo_core.read_bytes() == (ROOT / "scripts" / "kanban-transition-engine.py").read_bytes()
+    demo_core.write_text("demo sentinel\n", encoding="utf-8")
+    demo_wrapper_before = demo_wrapper.read_bytes()
+
+    second = subprocess.run(
+        [installer, "--profile", "orchestrator", "other"], text=True, capture_output=True, env=env
+    )
+    other_core = scripts / "ttf-other-transition-engine-core.py"
+    other_wrapper = scripts / "ttf-other-transition-engine.py"
+    assert second.returncode == 0, second.stderr
+    assert demo_core.read_text(encoding="utf-8") == "demo sentinel\n"
+    assert demo_wrapper.read_bytes() == demo_wrapper_before
+    assert other_core.read_bytes() == (ROOT / "scripts" / "kanban-transition-engine.py").read_bytes()
+    assert str(other_core) in other_wrapper.read_text(encoding="utf-8")
+    assert str(demo_core) not in other_wrapper.read_text(encoding="utf-8")
+
+
+def test_installer_leaves_legacy_active_when_replacement_fails(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    scripts.mkdir(parents=True)
+    old_wrapper = scripts / "ttf-demo-transition-engine.py"
+    old_core = scripts / "ttf-demo-transition-engine-core.py"
+    old_wrapper.write_text("old wrapper\n", encoding="utf-8")
+    old_core.write_text("old core\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' \
+    '  aaa111 [active]' '    Name:      demo-graph-governor' \
+    '  bbb222 [paused]' '    Name:      ttf-demo-transition-engine'
+fi
+case "$*" in "-p orchestrator cron edit bbb222 --schedule every 1m "*) exit 1 ;; esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HERMES_HOME": str(home),
+        "HERMES_TEST_LOG": str(log),
+    }
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert "cron pause aaa111" not in commands
+    assert old_wrapper.read_text(encoding="utf-8") == "old wrapper\n"
+    assert old_core.read_text(encoding="utf-8") == "old core\n"
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+
+
+def test_installer_restores_active_engine_when_interrupted(tmp_path):
+    import fcntl
+
+    home, db_path, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_job = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    scripts.mkdir(parents=True)
+    old_wrapper = scripts / "ttf-demo-transition-engine.py"
+    old_core = scripts / "ttf-demo-transition-engine-core.py"
+    old_wrapper.write_text("signal old wrapper\n", encoding="utf-8")
+    old_core.write_text("signal old core\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    ready = tmp_path / "ready-for-term"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+case "$*" in
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+payload["jobs"][0].update({"script": "replacement.py", "no_agent": True, "repeat": {"times": None, "completed": 2}})
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    : > "$HERMES_TEST_READY"
+    sleep 0.5 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    process = subprocess.Popen(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_READY": str(ready),
+        },
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not ready.exists():
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=10)
+        pytest.fail(f"installer did not reach the mutation boundary: {stdout}\n{stderr}")
+    process.terminate()
+    stdout, stderr = process.communicate(timeout=10)
+
+    commands = log.read_text(encoding="utf-8")
+    assert process.returncode == 143, (stdout, stderr)
+    assert commands.count("-p orchestrator cron status") >= 2
+    assert "cron resume bbb222" not in commands
+    assert old_wrapper.read_text(encoding="utf-8") == "signal old wrapper\n"
+    assert old_core.read_text(encoding="utf-8") == "signal old core\n"
+    assert json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"] == [original_job]
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+    with Path(f"{db_path}.ttf-install.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize(
+    ("target_id", "target_name", "extra_args"),
+    [
+        ("ccc333", "ttf-demo-transition-engine", []),
+        ("aaa111", "demo-graph-governor", ["--replace-legacy"]),
+    ],
+)
+def test_installer_restores_managed_pause_target_when_provider_sync_fails(
+    tmp_path, target_id, target_name, extra_args
+):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, target_id, target_name)
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  state=active; [ ! -f "$HERMES_TEST_PAUSED" ] || state=paused
+  printf '%s\n' \
+    '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
+    "  $HERMES_TEST_TARGET [$state]" "    Name:      $HERMES_TEST_TARGET_NAME"
+fi
+if [ "$*" = "-p orchestrator cron status" ] && [ ! -f "$HERMES_TEST_PAUSED" ] && \
+   python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_TARGET" <<'PY'
+import json, sys
+jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+raise SystemExit(not any(
+    job.get("id") == sys.argv[2] and job.get("enabled") is False and job.get("state") == "paused"
+    for job in jobs
+))
+PY
+then
+  : > "$HERMES_TEST_PAUSED"
+  exit 1
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", *extra_args, "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_TARGET": target_id,
+            "HERMES_TEST_TARGET_NAME": target_name,
+            "HERMES_TEST_PAUSED": str(tmp_path / "paused"),
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert "-p orchestrator cron status" in commands
+    assert f"cron pause {target_id}" not in commands
+    assert f"cron resume {target_id}" not in commands
+    restored_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    assert restored_target == original_target
+
+
+@pytest.mark.parametrize("preexisting_files", [False, True])
+def test_installer_discovers_fresh_job_when_create_is_interrupted(tmp_path, preexisting_files):
+    home, _, _ = make_board(tmp_path)
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    wrapper = scripts / "ttf-demo-transition-engine.py"
+    core = scripts / "ttf-demo-transition-engine-core.py"
+    if preexisting_files:
+        scripts.mkdir(parents=True)
+        wrapper.write_text("create signal old wrapper\n", encoding="utf-8")
+        core.write_text("create signal old core\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    active = tmp_path / "fresh-active"
+    paused = tmp_path / "fresh-paused"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  if [ -f "$HERMES_TEST_ACTIVE" ] && [ ! -f "$HERMES_TEST_PAUSED" ]; then
+    printf '%s\n' '  abc999 [active]' "    Name:      $(cat "$HERMES_TEST_CREATE_NAME")"
+  fi
+  exit 0
+fi
+case "$*" in
+  "-p orchestrator cron create --name ttf-demo-transition-engine-install-"*" --script ttf-demo-transition-engine.py --no-agent --repeat 0 every 1m")
+    printf '%s' "$6" > "$HERMES_TEST_CREATE_NAME"
+    : > "$HERMES_TEST_ACTIVE"
+    printf '%s\n' 'Created job: abc999'
+    kill -TERM "$PPID"
+    sleep 0.2
+    exit 143 ;;
+  "-p orchestrator cron pause abc999")
+    : > "$HERMES_TEST_PAUSED" ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HERMES_HOME": str(home),
+        "HERMES_TEST_LOG": str(log),
+        "HERMES_TEST_ACTIVE": str(active),
+        "HERMES_TEST_PAUSED": str(paused),
+        "HERMES_TEST_CREATE_NAME": str(tmp_path / "create-name"),
+    }
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_HOME", "HERMES_KANBAN_TASK"):
+        env.pop(key, None)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    commands = log.read_text(encoding="utf-8").splitlines()
+    create_index = next(index for index, line in enumerate(commands) if " cron create " in line)
+    rollback_list_index = next(
+        index
+        for index, line in enumerate(commands)
+        if index > create_index and line == "-p orchestrator cron list --all"
+    )
+    pause_index = next(
+        index
+        for index, line in enumerate(commands)
+        if index > create_index and line == "-p orchestrator cron pause abc999"
+    )
+    assert result.returncode == 143
+    assert create_index < rollback_list_index < pause_index
+    assert paused.is_file()
+    if preexisting_files:
+        assert wrapper.read_text(encoding="utf-8") == "create signal old wrapper\n"
+        assert core.read_text(encoding="utf-8") == "create signal old core\n"
+    else:
+        assert not wrapper.exists() and not core.exists()
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+
+
+def test_installer_rolls_back_replacement_when_activation_cannot_be_verified(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' \
+    '  aaa111 [active]' '    Name:      demo-graph-governor' \
+    '  bbb222 [paused]' '    Name:      ttf-demo-transition-engine'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+        },
+    )
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert commands.count("-p orchestrator cron status") >= 5
+    assert "cron pause aaa111" not in commands and "cron resume aaa111" not in commands
+    restored_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
+    assert restored_legacy == original_legacy
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    assert not (scripts / "ttf-demo-transition-engine.py").exists()
+    assert not (scripts / "ttf-demo-transition-engine-core.py").exists()
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == []
+
+
+def test_installer_rolls_back_replacement_when_verification_list_fails(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "aaa111", "demo-graph-governor")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    list_count = tmp_path / "list-count"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  count=0; [ ! -f "$HERMES_TEST_LIST_COUNT" ] || count=$(cat "$HERMES_TEST_LIST_COUNT")
+  count=$((count + 1)); printf '%s' "$count" > "$HERMES_TEST_LIST_COUNT"
+  [ "$count" -eq 2 ] && exit 1
+  printf '%s\n' \
+    '  aaa111 [active]' '    Name:      demo-graph-governor' \
+    '  bbb222 [paused]' '    Name:      ttf-demo-transition-engine'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_LIST_COUNT": str(list_count),
+        },
+    )
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert commands.count("-p orchestrator cron status") >= 5
+    assert "cron pause aaa111" not in commands and "cron resume aaa111" not in commands
+    restored_legacy = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == "aaa111"
+    )
+    assert restored_legacy == original_legacy
+
+
+def test_installer_restores_duplicate_current_jobs_when_pause_provider_sync_fails(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(home, "ccc333", "ttf-demo-transition-engine")
+    add_cron_job(home, "ddd444", "ttf-demo-transition-engine")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    originals = {
+        job["id"]: job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+    }
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' \
+    '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
+    '  ccc333 [active]' '    Name:      ttf-demo-transition-engine' \
+    '  ddd444 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+if [ "$*" = "-p orchestrator cron status" ] && [ ! -f "$HERMES_TEST_FAILED" ] && \
+   python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+raise SystemExit(not any(job.get("id") == "ddd444" and job.get("state") == "paused" for job in jobs))
+PY
+then
+  : > "$HERMES_TEST_FAILED"
+  exit 1
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_FAILED": str(tmp_path / "failed"),
+        },
+    )
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert commands.count("-p orchestrator cron status") >= 3
+    assert "cron pause ccc333" not in commands and "cron resume ccc333" not in commands
+    assert "cron pause ddd444" not in commands and "cron resume ddd444" not in commands
+    restored = {
+        job["id"]: job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+    }
+    assert restored == originals
+
+
+@pytest.mark.parametrize(
+    ("target_id", "target_name", "extra_args"),
+    [
+        ("aaa111", "demo-graph-governor", ["--replace-legacy"]),
+        ("ccc333", "ttf-demo-transition-engine", []),
+    ],
+)
+@pytest.mark.parametrize("outcome", ["completed", "error"])
+def test_installer_preserves_managed_terminal_progress_while_parked(
+    tmp_path, target_id, target_name, extra_args, outcome
+):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    add_cron_job(
+        home,
+        target_id,
+        target_name,
+        repeat={"times": 3 if outcome == "completed" else None, "completed": 2},
+        next_run_at="due-run",
+        last_status="running",
+    )
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    completed = tmp_path / "completed"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  if [ -f "$HERMES_TEST_COMPLETED" ]; then
+    printf '%s\n' \
+      '  bbb222 [paused]' '    Name:      ttf-demo-transition-engine' \
+      "  $HERMES_TEST_TARGET [$HERMES_TEST_OUTCOME]" "    Name:      $HERMES_TEST_TARGET_NAME"
+  else
+    printf '%s\n' \
+      '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
+      "  $HERMES_TEST_TARGET [active]" "    Name:      $HERMES_TEST_TARGET_NAME"
+  fi
+fi
+if [ "$*" = "-p orchestrator cron status" ] && [ ! -f "$HERMES_TEST_COMPLETED" ]; then
+  python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_TARGET" \
+    "$HERMES_TEST_COMPLETED" "$HERMES_TEST_OUTCOME" <<'PY'
+import json, sys
+from pathlib import Path
+path, target, completed, outcome = sys.argv[1:]
+payload = json.load(open(path, encoding="utf-8"))
+job = next(job for job in payload["jobs"] if job["id"] == target)
+if job["enabled"] is not False or job["state"] != "paused":
+    raise SystemExit(0)
+if outcome == "completed":
+    job.update({
+        "repeat": {"times": 3, "completed": 3},
+        "enabled": False,
+        "state": "completed",
+        "next_run_at": None,
+        "last_status": "ok",
+        "last_run_at": "completed-while-parked",
+        "last_error": None,
+    })
+else:
+    job.update({
+        "repeat": {"times": None, "completed": 3},
+        "enabled": False,
+        "state": "error",
+        "next_run_at": None,
+        "last_status": "error",
+        "last_run_at": "failed-while-parked",
+        "last_error": "failed to compute next run",
+    })
+json.dump(payload, open(path, "w", encoding="utf-8"))
+Path(completed).touch()
+PY
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", *extra_args, "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_LOG": str(log),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_TARGET": target_id,
+            "HERMES_TEST_TARGET_NAME": target_name,
+            "HERMES_TEST_COMPLETED": str(completed),
+            "HERMES_TEST_OUTCOME": outcome,
+        },
+    )
+
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert completed.is_file()
+    assert f"cron resume {target_id}" not in commands
+    restored_target = next(
+        job
+        for job in json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        if job["id"] == target_id
+    )
+    assert restored_target["schedule"] == original_target["schedule"]
+    expected_repeat = {"times": 3 if outcome == "completed" else None, "completed": 3}
+    assert restored_target["repeat"] == expected_repeat
+    assert restored_target["enabled"] is (outcome == "error")
+    assert restored_target["state"] == outcome
+    assert restored_target["next_run_at"] is None
+    assert restored_target["last_status"] == ("ok" if outcome == "completed" else "error")
+    assert restored_target["last_run_at"] == (
+        "completed-while-parked" if outcome == "completed" else "failed-while-parked"
+    )
+
+
+@pytest.mark.parametrize(
+    ("progress_mode", "completed", "expected_enabled", "expected_state", "expected_next"),
+    [
+        ("installer-only", 2, True, "scheduled", "old-next-run"),
+        ("resume-gap", 3, True, "scheduled", "new-next-run"),
+        ("run", 3, True, "scheduled", "new-next-run"),
+        ("next-only", 2, True, "scheduled", "new-next-run"),
+        ("exhausted", 7, False, "completed", None),
+    ],
+)
+def test_installer_restores_jobs_when_post_activation_convergence_fails(
+    tmp_path, progress_mode, completed, expected_enabled, expected_state, expected_next
+):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(
+        home,
+        "bbb222",
+        "ttf-demo-transition-engine",
+        monitor_url="https://example.test/old-monitor",
+        provider_snapshot="old-provider",
+        model_snapshot="old-model",
+        skill="legacy-skill",
+        next_run_at="old-next-run",
+        last_status="running",
+        fire_claim={"at": "old-claim", "by": "runner"},
+    )
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+    payload["jobs"][0]["name"] = None
+    jobs_path.write_text(json.dumps(payload), encoding="utf-8")
+    original_job = payload["jobs"][0]
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    scripts.mkdir(parents=True)
+    old_wrapper = scripts / "ttf-demo-transition-engine.py"
+    old_core = scripts / "ttf-demo-transition-engine-core.py"
+    old_wrapper.write_text("late old wrapper\n", encoding="utf-8")
+    old_core.write_text("late old core\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "hermes.log"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$HERMES_TEST_LOG"
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  if [ -f "$HERMES_TEST_RESUMED" ]; then
+    printf '%s\n' \
+      '  bbb222 [active]' '    Name:      ttf-demo-transition-engine' \
+      '  ddd444 [active]' '    Name:      ttf-demo-transition-engine'
+  else
+    printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+  fi
+fi
+case "$*" in
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_PROGRESS" <<'PY'
+import json, sys
+path = sys.argv[1]
+mode = sys.argv[2]
+payload = json.load(open(path, encoding="utf-8"))
+job = payload["jobs"][0]
+job.update({
+    "schedule": {"kind": "interval", "minutes": 1, "display": "every 1m"},
+    "schedule_display": "every 1m",
+    "script": "ttf-demo-transition-engine.py",
+    "no_agent": True,
+    "repeat": {"times": None, "completed": 2},
+    "monitor_url": None,
+    "provider_snapshot": None,
+    "model_snapshot": None,
+    "skills": ["legacy-skill"],
+})
+payload["jobs"].append({"id": "concurrent", "name": "unrelated"})
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    ;;
+esac
+if [ "$*" = "-p orchestrator cron status" ]; then
+  python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_PROGRESS" \
+    "$HERMES_TEST_RESUMED" "$HERMES_TEST_FAILED" <<'PY'
+import json, sys
+from pathlib import Path
+path, mode, resumed_name, failed_name = sys.argv[1:]
+resumed, failed = Path(resumed_name), Path(failed_name)
+payload = json.load(open(path, encoding="utf-8"))
+job = payload["jobs"][0]
+if (
+    not resumed.exists()
+    and job.get("state") == "scheduled"
+    and job.get("script") == "ttf-demo-transition-engine.py"
+):
+    resumed.touch()
+    if mode == "resume-gap":
+        job.update({
+            "repeat": {"times": None, "completed": 3}, "last_status": "ok",
+            "last_run_at": "new-completion", "last_error": None,
+            "fire_claim": None, "next_run_at": "new-next-run",
+        })
+    competitor = dict(job)
+    competitor.update({"id": "ddd444", "name": "ttf-demo-transition-engine"})
+    payload["jobs"].append(competitor)
+elif resumed.exists() and not failed.exists():
+    competitor = next(
+        (candidate for candidate in payload["jobs"] if candidate.get("id") == "ddd444"),
+        None,
+    )
+    if competitor is not None and competitor.get("state") == "paused":
+        if mode == "run":
+            job.update({"repeat": {"times": None, "completed": 3}, "last_status": "ok",
+                        "last_run_at": "new-completion", "last_error": None,
+                        "fire_claim": None, "next_run_at": "new-next-run"})
+        elif mode == "next-only":
+            job["next_run_at"] = "new-next-run"
+        elif mode == "exhausted":
+            job.update({"repeat": {"times": None, "completed": 7}, "last_status": "ok",
+                        "last_run_at": "new-completion", "last_error": None,
+                        "fire_claim": None, "next_run_at": "new-next-run"})
+        failed.touch()
+        json.dump(payload, open(path, "w", encoding="utf-8"))
+        raise SystemExit(7)
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+  [ "$?" -eq 0 ] || exit 1
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HERMES_HOME": str(home),
+        "HERMES_TEST_LOG": str(log),
+        "HERMES_TEST_JOBS": str(jobs_path),
+        "HERMES_TEST_PROGRESS": progress_mode,
+        "HERMES_TEST_RESUMED": str(tmp_path / "resumed"),
+        "HERMES_TEST_FAILED": str(tmp_path / "failed"),
+    }
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "--replace-legacy", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    commands = log.read_text(encoding="utf-8")
+    assert result.returncode != 0
+    assert (tmp_path / "resumed").is_file()
+    assert (tmp_path / "failed").is_file()
+    assert commands.count("-p orchestrator cron status") >= 3
+    assert "cron resume bbb222" not in commands
+    assert "cron resume ddd444" not in commands
+    restored_jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+    restored = restored_jobs[0]
+    assert restored["schedule"] == original_job["schedule"]
+    assert restored["schedule_display"] == original_job["schedule_display"]
+    assert restored["script"] == original_job["script"]
+    assert restored["no_agent"] == original_job["no_agent"]
+    assert restored["monitor_url"] == original_job["monitor_url"]
+    assert restored["provider_snapshot"] == original_job["provider_snapshot"]
+    assert restored["model_snapshot"] == original_job["model_snapshot"]
+    assert restored["name"] is None
+    assert restored["skill"] == original_job["skill"] and "skills" not in restored
+    assert restored["repeat"] == {"times": 7, "completed": completed}
+    assert restored["next_run_at"] == expected_next
+    assert restored["enabled"] is expected_enabled and restored["state"] == expected_state
+    if progress_mode in {"installer-only", "next-only"}:
+        assert restored["last_status"] == "running"
+        assert restored["fire_claim"] == {"at": "old-claim", "by": "runner"}
+    else:
+        assert restored["last_status"] == "ok" and restored["last_run_at"] == "new-completion"
+        assert restored["fire_claim"] is None
+    assert restored_jobs[1] == {"id": "concurrent", "name": "unrelated"}
+    assert commands.count("-p orchestrator cron status") >= 3
+    assert old_wrapper.read_text(encoding="utf-8") == "late old wrapper\n"
+    assert old_core.read_text(encoding="utf-8") == "late old core\n"
+    assert list(scripts.glob(".ttf-demo-engine-rollback.*")) == [], result.stderr
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        {"enabled": True, "state": "error"},
+        {"enabled": False, "state": "completed"},
+        {"enabled": False, "state": "scheduled"},
+        {
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "old-pause",
+            "paused_reason": "owner",
+            "repeat": {"times": 7, "completed": 7},
+        },
+    ],
+)
+def test_installer_parks_every_existing_job_shape_before_edit(tmp_path, original):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine", **original)
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original_job = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    observed = tmp_path / "observed"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+case "$*" in
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" "$HERMES_TEST_OBSERVED" <<'PY'
+import json, sys
+job = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"][0]
+assert job["enabled"] is False and job["state"] == "paused" and job.get("paused_at")
+open(sys.argv[2], "w", encoding="utf-8").write("parked")
+PY
+    exit 1 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_OBSERVED": str(observed),
+        },
+    )
+
+    assert result.returncode != 0
+    assert observed.read_text(encoding="utf-8") == "parked"
+    assert json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"] == [original_job]
+
+
+def test_installer_final_restore_runs_after_provider_notification_failure(tmp_path):
+    home, _, _ = make_board(tmp_path)
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine")
+    jobs_path = home / "profiles" / "orchestrator" / "cron" / "jobs.json"
+    original = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    counter = tmp_path / "counter"
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p orchestrator cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+case "$*" in
+  "-p orchestrator cron status")
+    count=0; [ ! -f "$HERMES_TEST_COUNTER" ] || count=$(cat "$HERMES_TEST_COUNTER")
+    count=$((count + 1)); printf '%s' "$count" > "$HERMES_TEST_COUNTER"
+    if [ "$count" -eq 3 ]; then
+      exit 1
+    fi ;;
+  "-p orchestrator cron edit bbb222 --schedule every 1m "*)
+    python3 - "$HERMES_TEST_JOBS" <<'PY'
+import json, sys
+path = sys.argv[1]
+payload = json.load(open(path, encoding="utf-8"))
+payload["jobs"][0]["script"] = "replacement.py"
+json.dump(payload, open(path, "w", encoding="utf-8"))
+PY
+    exit 1 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(ROOT / "scripts" / "enable-kanban-autopilot.sh"),
+            "--profile", "orchestrator", "demo",
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_JOBS": str(jobs_path),
+            "HERMES_TEST_COUNTER": str(counter),
+        },
+    )
+
+    restored = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    assert result.returncode != 0
+    assert restored == original
+    scripts = home / "profiles" / "orchestrator" / "scripts"
+    assert len(list(scripts.glob(".ttf-demo-engine-rollback.*"))) == 1
+
+
+def test_local_install_restores_previous_plugin_when_enable_fails(tmp_path):
+    home = tmp_path / "home"
+    old_plugin = home / "plugins" / "thinktofinish-company"
+    old_plugin.mkdir(parents=True)
+    (old_plugin / "sentinel").write_text("old", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+case "$*" in "-p default plugins enable thinktofinish-company --no-allow-tool-override") exit 1 ;; esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)},
+    )
+    assert result.returncode != 0
+    assert (old_plugin / "sentinel").read_text(encoding="utf-8") == "old"
+
+    fresh_home = tmp_path / "fresh-home"
+    fresh = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(fresh_home)},
+    )
+    assert fresh.returncode != 0
+    assert not (fresh_home / "plugins" / "thinktofinish-company").exists()
+
+
+def test_local_install_restores_previous_plugin_when_interrupted(tmp_path):
+    home = tmp_path / "home"
+    old_plugin = home / "plugins" / "thinktofinish-company"
+    old_plugin.mkdir(parents=True)
+    (old_plugin / "sentinel").write_text("old", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+case "$*" in
+  "-p default plugins enable thinktofinish-company --no-allow-tool-override")
+    kill -TERM "$PPID"; sleep 0.1; exit 143 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)},
+    )
+
+    assert result.returncode == 143
+    assert (old_plugin / "sentinel").read_text(encoding="utf-8") == "old"
+    assert list((home / "plugins").glob(".thinktofinish-company.*")) == []
+
+
+@pytest.mark.parametrize("home_name", [".hermes", "[runtime]", "q?mark", "star*path", "back\\slash"])
+def test_local_install_excludes_hermes_home_nested_in_source(tmp_path, home_name):
+    source = tmp_path / "source"
+    scripts = source / "scripts"
+    scripts.mkdir(parents=True)
+    installer = scripts / "install-local.sh"
+    installer.write_bytes((ROOT / "scripts" / "install-local.sh").read_bytes())
+    installer.chmod(0o755)
+    for required in ("plugin.json", "mcp.json", "server.py"):
+        (source / required).write_bytes((ROOT / required).read_bytes())
+
+    home = source / home_name
+    home.mkdir()
+    (home / "auth.json").write_text('{"token":"must-not-copy"}\n', encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+
+    for _ in range(2):
+        result = subprocess.run(
+            [str(installer), "--profile", "default"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+
+    target = home / "plugins" / "thinktofinish-company"
+    assert (target / "plugin.json").is_file()
+    assert not (target / home_name).exists()
+    assert list((home / "plugins").glob(".thinktofinish-company.*")) == []
+
+    if home_name == ".hermes":
+        same_root = subprocess.run(
+            [str(installer), "--profile", "default"],
+            text=True,
+            capture_output=True,
+            env={**env, "HERMES_HOME": str(source)},
+        )
+        assert same_root.returncode == 2
+        assert "must not be the plugin source directory" in same_root.stderr
+
+
+def test_local_install_does_not_restore_an_unowned_pid_backup(tmp_path):
+    home = tmp_path / "home"
+    target = home / "plugins" / "thinktofinish-company"
+    target.mkdir(parents=True)
+    (target / "sentinel").write_text("current", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+case "$*" in "-p default plugins enable thinktofinish-company --no-allow-tool-override") exit 1 ;; esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    result = subprocess.run(
+        [
+            "/bin/bash", "-c",
+            'stale="$HERMES_HOME/plugins/.thinktofinish-company.backup.$$"; '
+            'mkdir -p "$stale"; printf stale > "$stale/sentinel"; '
+            'exec "$INSTALL_SCRIPT" --profile default',
+        ],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "INSTALL_SCRIPT": str(ROOT / "scripts" / "install-local.sh"),
+        },
+    )
+
+    assert result.returncode != 0
+    assert (target / "sentinel").read_text(encoding="utf-8") == "current"
+    stale = list((home / "plugins").glob(".thinktofinish-company.backup.*"))
+    assert len(stale) == 1
+    assert (stale[0] / "sentinel").read_text(encoding="utf-8") == "stale"
+
+
+def test_local_install_retains_owned_backup_when_target_removal_fails(tmp_path):
+    home = tmp_path / "home"
+    target = home / "plugins" / "thinktofinish-company"
+    target.mkdir(parents=True)
+    (target / "sentinel").write_text("old", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+case "$*" in "-p default plugins enable thinktofinish-company --no-allow-tool-override") exit 1 ;; esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    fake_rm = fake_bin / "rm"
+    fake_rm.write_text(
+        """#!/bin/sh
+if [ "$*" = "-rf $HERMES_TEST_TARGET" ]; then exit 1; fi
+exec /bin/rm "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_rm.chmod(0o755)
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_HOME": str(home),
+            "HERMES_TEST_TARGET": str(target),
+        },
+    )
+
+    assert result.returncode != 0
+    assert (target / "plugin.json").is_file()
+    assert not (target / "previous").exists()
+    backups = list((home / "plugins").glob(".thinktofinish-company.backup.*"))
+    assert len(backups) == 1
+    assert (backups[0] / "previous" / "sentinel").read_text(encoding="utf-8") == "old"
+
+
+def test_local_install_distinguishes_shared_and_profile_homes(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hermes.chmod(0o755)
+    base_env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    for key in ("HERMES_PROFILE", "HERMES_PROFILE_NAME"):
+        base_env.pop(key, None)
+
+    nested_shared = tmp_path / "srv" / "profiles" / "team"
+    nested_shared.mkdir(parents=True)
+    shared_result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={**base_env, "HERMES_HOME": str(nested_shared)},
+    )
+    assert shared_result.returncode == 0, shared_result.stderr
+    assert (nested_shared / "plugins" / "thinktofinish-company" / "plugin.json").is_file()
+
+    shared = tmp_path / "actual-home"
+    profile_home = shared / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    (profile_home / "profile.yaml").write_text("description: worker\n", encoding="utf-8")
+    profile_result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={**base_env, "HERMES_HOME": str(profile_home)},
+    )
+    assert profile_result.returncode == 0, profile_result.stderr
+    assert (shared / "plugins" / "thinktofinish-company" / "plugin.json").is_file()
+    assert not (profile_home / "plugins").exists()
+
+    profile_alias = tmp_path / "active-profile-alias"
+    profile_alias.symlink_to(profile_home, target_is_directory=True)
+    alias_result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={**base_env, "HERMES_HOME": str(profile_alias)},
+    )
+    assert alias_result.returncode == 0, alias_result.stderr
+    assert (shared / "plugins" / "thinktofinish-company" / "plugin.json").is_file()
+    assert not (profile_home / "plugins").exists()
+
+    linked_shared = tmp_path / "linked-home"
+    linked_profiles = linked_shared / "profiles"
+    linked_profiles.mkdir(parents=True)
+    external_profile = tmp_path / "external-profile"
+    external_profile.mkdir()
+    (external_profile / "profile.yaml").write_text("description: linked\n", encoding="utf-8")
+    linked_profile = linked_profiles / "worker"
+    linked_profile.symlink_to(external_profile, target_is_directory=True)
+    linked_result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={**base_env, "HERMES_HOME": str(linked_profile)},
+    )
+    assert linked_result.returncode == 0, linked_result.stderr
+    assert (linked_shared / "plugins" / "thinktofinish-company" / "plugin.json").is_file()
+    assert not (external_profile / "plugins").exists()
+
+    legacy_shared = tmp_path / "legacy-home"
+    legacy_profile = legacy_shared / "profiles" / "worker"
+    legacy_profile.mkdir(parents=True)
+    legacy_result = subprocess.run(
+        [str(ROOT / "scripts" / "install-local.sh"), "--profile", "default"],
+        text=True,
+        capture_output=True,
+        env={
+            **base_env,
+            "HERMES_HOME": str(legacy_profile),
+            "HERMES_PROFILE": "worker",
+        },
+    )
+    assert legacy_result.returncode == 0, legacy_result.stderr
+    assert (legacy_shared / "plugins" / "thinktofinish-company" / "plugin.json").is_file()
+    assert not (legacy_profile / "plugins").exists()
+
+
+def test_autopilot_installer_preserves_shared_home_nested_under_profiles(tmp_path):
+    home, _, _ = make_board(tmp_path / "srv" / "profiles")
+    add_cron_job(home, "bbb222", "ttf-demo-transition-engine", profile="default")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text(
+        """#!/bin/sh
+if [ "$*" = "-p default cron list --all" ]; then
+  printf '%s\n' '  bbb222 [active]' '    Name:      ttf-demo-transition-engine'
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+    for key in ("HERMES_PROFILE", "HERMES_PROFILE_NAME", "HERMES_KANBAN_DB", "HERMES_KANBAN_HOME"):
+        env.pop(key, None)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "enable-kanban-autopilot.sh"), "--profile", "default", "demo"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (home / "scripts" / "ttf-demo-transition-engine.py").is_file()
+
+
+def test_bootstrap_preserves_shared_home_nested_under_profiles(tmp_path):
+    home = tmp_path / "srv" / "profiles" / "team"
+    home.mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    hermes = fake_bin / "hermes"
+    hermes.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hermes.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "HERMES_HOME": str(home)}
+    for key in ("HERMES_PROFILE", "HERMES_PROFILE_NAME"):
+        env.pop(key, None)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "bootstrap-hermes.sh")],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (home / "plugins" / "thinktofinish-company" / "plugin.json").is_file()
+    assert (home / "profiles" / "orchestrator" / "SOUL.md").is_file()

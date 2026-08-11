@@ -85,7 +85,7 @@ Hermes loads the read-only namespaced skills and starts the local stdio MCP serv
 - `company-orchestrator` — use Hermes Kanban as the macro graph; never implement production code from the orchestrator.
 - `product-discovery` — create stable requirement IDs and acceptance criteria.
 - `architecture-contract` — produce ADRs, boundaries, contracts, and verification plans.
-- `engineering-delivery` — implement in a worktree/branch, use goal loops and deterministic gates, leave evidence.
+- `engineering-delivery` — implement in a worktree/branch, use an internal repair loop and deterministic gates, then leave a reviewed handoff.
 - `qa-release-gate` — independent review, security, traceability, and release-candidate evidence.
 
 ### Mini-HRMS pilot
@@ -167,7 +167,7 @@ Recommended engineering policy:
 
 - One Board = one project
 - Coding tasks use `worktree`
-- Engineering cards use goal mode when the task requires iterative repair
+- Goal mode is only for self-contained orchestration/research loops; engineering producers use normal cards and pre-created independent reviewer children
 - Reviewer is not the producer
 - No direct push to `main`
 - Production credentials are not available to `engineer`
@@ -202,7 +202,7 @@ The kickoff card creates Product → Architecture → a second orchestrator plan
 Keep the Hermes gateway running:
 
 ```bash
-hermes gateway start
+hermes -p orchestrator gateway start
 ```
 
 Open the dashboard:
@@ -217,7 +217,7 @@ The intended pattern is:
 
 ```text
 Kanban Graph = macro workflow
-Goal Loop    = micro workflow
+Worker Loop  = bounded repair/verification workflow
 ```
 
 For example, an engineering card should iterate:
@@ -234,6 +234,24 @@ Research → Product Spec → Architecture
                       ├→ Frontend ├→ Integration → Review → Security → RC
                       └→ Data ────┘
 ```
+
+### Deterministic Kanban transitions
+
+Enable the board-scoped transition engine after creating a pilot:
+
+```bash
+./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
+```
+
+It installs one no-agent cron for that board only. Reviewers write a structured `ttf_review` verdict; on `changes_requested`, the engine creates a remediation/re-review pair, rewires downstream dependencies to the replacement review, refreshes completed approval gates that the new commit invalidates, and archives the rejected review as evidence. It rejects dirty Git handoffs, admits only one active transition per checkout, and replaces a deferred stale verdict with a runnable fresh-review card after an earlier remediation changes `HEAD`. After three rejected remediation or stale-review generations it creates one retained owner-input gate and leaves downstream work gated. It never approves a review, bypasses a typed human/capability gate, deploys, pushes `main`, or handles real credentials/PII.
+
+When upgrading a board that still has a legacy handoff/governor cron, first migrate every reviewer profile to the structured verdict contract above, then take over explicitly:
+
+```bash
+./scripts/enable-kanban-autopilot.sh --profile orchestrator --replace-legacy mini-hrms
+```
+
+The installer scans every Hermes profile, pauses each matching active legacy job, and converges duplicate/current jobs to one infinite no-agent cron. Each board gets its own atomically replaced engine copy, and a failed cron takeover restores the previous copy. Re-run the same command for each managed board after updating this plugin so that board's installed engine is refreshed.
 
 ---
 
@@ -439,6 +457,7 @@ Runtime policy source-of-truth in V0.1 is the JSON set:
 ```text
 policies/company.json
 policies/autonomy.json
+policies/kanban-autopilot.json
 policies/quality.json
 policies/security.json
 ```
@@ -494,8 +513,7 @@ Until then, `scripts/install-local.sh` performs the equivalent local installatio
 
 V0.1 intentionally **does not** rebuild capabilities Hermes already owns:
 
-- No custom graph engine
-- No custom dispatcher/scheduler
+- No replacement graph scheduler/dispatcher; only a narrow deterministic review-transition reconciler
 - No custom Agent runtime
 - No custom worktree manager
 - No custom Goal loop
