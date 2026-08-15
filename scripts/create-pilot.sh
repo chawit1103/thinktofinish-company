@@ -18,9 +18,19 @@ if ! git -C "$PROJECT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
   echo "Target Git repository needs at least one commit before Hermes can create worktrees." >&2
   exit 1
 fi
+if ! command -v hermes >/dev/null 2>&1; then
+  echo "Hermes is not installed or not on PATH." >&2
+  exit 1
+fi
 
-# Install a project constitution only when the repo has no supported project context file.
-# Never overwrite a user's existing instructions.
+if command -v omh >/dev/null 2>&1; then
+  WORK_LAYER_NOTE="Oh My Hermes is available. Use OMH for interview/research/planning/work coordination/coding-owner handoffs where useful, while preserving TTF company authority."
+else
+  WORK_LAYER_NOTE="Oh My Hermes is not available. Use Hermes-native capabilities without changing TTF company policy, task contracts, traceability, or release gates."
+  echo "Warning: OMH is not on PATH; the pilot will use the Hermes-native fallback." >&2
+  echo "Recommended setup: $ROOT/scripts/bootstrap-company.sh" >&2
+fi
+
 if [[ ! -f "$PROJECT_DIR/.hermes.md" && ! -f "$PROJECT_DIR/HERMES.md" && ! -f "$PROJECT_DIR/AGENTS.md" && ! -f "$PROJECT_DIR/CLAUDE.md" && ! -f "$PROJECT_DIR/.cursorrules" ]]; then
   cp "$ROOT/templates/PROJECT_AGENTS.md" "$PROJECT_DIR/AGENTS.md"
   echo "Installed project constitution template: $PROJECT_DIR/AGENTS.md (not auto-committed)"
@@ -31,17 +41,23 @@ fi
 
 hermes kanban boards create "$BOARD" \
   --name "Mini HRMS Pilot" \
-  --description "ThinkToFinish AI Software Company V1 pilot" \
+  --description "ThinkToFinish Company Core + OMH + Hermes pilot" \
   --icon "🏗️" \
   --switch 2>/dev/null || hermes kanban boards switch "$BOARD"
 
-# Hermes latest supports a per-board default project directory. With a Git repo,
-# this lets dispatched tasks use preserved worktree workspaces instead of racing
-# one shared checkout.
 hermes kanban boards set-default-workdir "$BOARD" "$PROJECT_DIR"
 
-IFS= read -r -d '' ROOT_BODY <<'BODY' || true
-You are the ThinkToFinish company orchestrator. Your job on this card is to PLAN AND DISPATCH the project graph, not to implement production code.
+IFS= read -r -d '' ROOT_BODY <<BODY || true
+You are the ThinkToFinish company orchestrator. PLAN AND DISPATCH company phases; do not implement production code on this kickoff card.
+
+Layer authority:
+- ThinkToFinish owns WHAT/WHY: business scope, Product Spec, requirement IDs, Architecture Contract/ADRs, Company Task Contracts, policy, traceability, risk/approval, release governance, and company metrics.
+- Oh My Hermes owns HOW TO ORGANIZE WORK when available: interview/research/planning, work coordination, coding-owner selection/handoff, long-horizon workflow memory, and execution observations.
+- Hermes owns HOW TO RUN IT: Profiles, Kanban, goals/loops, native review/rework, delegation, sessions, plugins, worktrees/sandbox, gateway, and cron.
+- Coding owners own implementation and review fixes.
+
+Work-layer status:
+$WORK_LAYER_NOTE
 
 Business goal:
 Deliver a Release Candidate for a Mini HRMS serving Thai SMEs (50-500 employees).
@@ -61,26 +77,30 @@ Out of scope:
 Company constraints:
 - Use ThinkToFinish policy, task-contract, traceability, release-gate, and metrics tools.
 - Create stable requirement IDs before implementation.
-- Producer and independent reviewer must be separate roles.
-- Engineering work uses the board-linked Git project/worktrees and PRs; never push directly to main.
-- Engineering producer tasks use normal Kanban cards, not goal_mode. Each producer must have a pre-created independent `qa-reviewer` child; the producer's terminal outcome is a verified `review-required:` commit handoff.
+- Product may use OMH `ulw-interview` / `ulw-research`; the TTF Product Spec remains authoritative.
+- Architecture may use OMH research/planning; accepted ADRs/contracts remain TTF authority.
+- Engineering may use OMH to organize work and select/prepare coding-owner handoffs. Never weaken the Company Task Contract to fit a workflow/executor.
+- Use Hermes native same-card implementation review. A ready producer calls `kanban_request_review(..., reviewer="qa-reviewer")`; the reviewer approves or calls `kanban_request_changes(reason=...)` to return work to the original implementer.
+- Do NOT create a pre-created review child for the same implementation phase. Do NOT use `kanban_block` or the legacy TTF transition engine for ordinary review feedback.
+- Keep integrated QA/Security and Release Evidence as separate downstream company gates.
 - Production deployment, destructive migrations, credentials, paid services, major scope changes, production DB writes, and security exceptions require human approval.
-- Direct push to main, bypassing review, disabling security controls, and exposing credentials are forbidden.
+- Direct push to main, bypassing required review, disabling security controls, and exposing credentials are forbidden.
 
-Required orchestration pattern:
-1. Create a Product Discovery / Product Spec card assigned to `product`, goal_mode=true. It must produce stable requirement IDs and explicit acceptance criteria, and record requirement traceability nodes.
-2. Create an Architecture Contract card assigned to `architect`, parented on the Product card, goal_mode=true. It must produce ADRs, API/data/security boundaries, and a verification plan.
-3. Create a second orchestrator card assigned to `orchestrator`, parented on the Architecture card, goal_mode=true, titled roughly "Plan and dispatch Mini HRMS engineering DAG". Its body must instruct that future orchestrator to read Product + Architecture handoffs and then create the concrete engineering graph, including:
-   - 2-4 parallelizable implementation cards assigned to `engineer` where architecture permits, each with a pre-created read-only `qa-reviewer` child;
-   - an integration card gated on approved implementation reviews, with its own pre-created read-only `qa-reviewer` child;
-   - independent QA/security card assigned to `qa-reviewer` gated on the approved integration-review child, never on the integration producer directly;
-   - release-evidence card assigned to `release-manager` gated on QA/security;
-   - final company closeout card assigned to `orchestrator` gated on release evidence.
-   Every implementation card must include a Company Task Contract (goal, inputs, outputs, acceptance criteria, verification, risk, assignee, review/security, requirement IDs). Engineering producer cards must use goal_mode=false and state that `review-required:` is the handoff completion, not a block.
-4. The final company closeout must check requirement coverage and release evidence using ThinkToFinish tools. It may declare only Release Candidate readiness; production remains human-gated.
-5. Complete this kickoff card after those three cards and dependencies have been created. Include the created card IDs in `created_cards` and summarize the graph.
+Required staged graph:
+1. Create Product Discovery / Product Spec assigned to `product`, goal_mode=true. It must create stable requirement IDs, explicit acceptance criteria, scope/non-scope, risks/assumptions, and requirement traceability nodes. It may use OMH interview/research but must output a TTF Product Spec.
+2. Create Architecture Contract assigned to `architect`, parented on Product, goal_mode=true. It must create ADRs, API/data/security boundaries, a shared Decision Packet, verification plan, and requirement→ADR trace links. It may use OMH research/planning but must output a TTF Architecture Contract.
+3. Create a second orchestrator planning card assigned to `orchestrator`, parented on Architecture, goal_mode=true, titled roughly "Plan and dispatch Mini HRMS engineering work packages". That card must read Product + Architecture handoffs and create the concrete company graph:
+   - 2-4 meaningful implementation work packages assigned to `engineer` where architecture permits;
+   - each implementation task has a validated Company Task Contract and uses Hermes native same-card review with `qa-reviewer`;
+   - OMH may organize implementation/coding-owner handoffs inside each work package, but the Kanban board must not mirror OMH internal sub-work card-for-card;
+   - one integration work package gated on the reviewed/done implementation tasks, also using native same-card review;
+   - one independent integrated QA/Security company card assigned to `qa-reviewer` gated on reviewed integration;
+   - one Release Evidence card assigned to `release-manager` gated on QA/Security;
+   - one Company Closeout card assigned to `orchestrator` gated on Release Evidence.
+4. The final Company Closeout must call ThinkToFinish coverage/release tools and may declare only Release Candidate readiness. OMH QA success, green CI, or Hermes task completion alone is not sufficient.
+5. Complete this kickoff after the Product, Architecture, and second orchestrator planning cards plus their dependencies exist. Include created card IDs and summarize the company graph.
 
-Do not implement the HRMS on this kickoff card. The Definition of Done for this card is a correctly staged project graph that can proceed without further prompting.
+Do not create custom schedulers, remediation graphs, memory engines, executor routers, or Kanban database transitions. Prefer native OMH/Hermes contracts.
 BODY
 
 hermes kanban create "Orchestrate Mini HRMS to Release Candidate" \
@@ -96,4 +116,4 @@ echo "Project directory: $PROJECT_DIR"
 echo "Board default workdir: $PROJECT_DIR"
 echo "Keep/start gateway: hermes -p orchestrator gateway start"
 echo "Open dashboard: hermes dashboard"
-echo "The orchestrator kickoff should create Product → Architecture → governed Engineering DAG automatically."
+echo "Expected company flow: Product → Architecture → Engineering Work Packages → Integration → QA/Security → Release Evidence → RC."

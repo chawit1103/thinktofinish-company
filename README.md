@@ -1,561 +1,277 @@
-# ThinkToFinish Company Layer for Hermes
+# ThinkToFinish Company Core
 
-**Turn Hermes Agent into a governed AI Software Company.**
+**Turn Hermes + Oh My Hermes into a governed AI Software Company.**
 
-ThinkToFinish Company Layer is a portable-first governance and delivery layer for Hermes Agent. It does **not** replace Hermes Kanban, Profiles, Goal loops, Skills, worktrees, delegation, Codex runtime, webhooks, or dashboards. It adds the company semantics that sit above those primitives:
-
-- **Policy** — what AI may do autonomously, what needs human approval, and what is forbidden.
-- **Task Contract** — a consistent Definition of Done for every work item.
-- **Traceability** — Requirement → Task → Commit → PR → Test → Release.
-- **Release Evidence** — deterministic evidence required before a release is considered ready.
-- **Metrics** — cycle time, retries, first-pass rate, human intervention, cost, and autonomous completion.
-
-The operating model is:
-
-```text
-Agent      = Capability
-Loop       = Reliability
-Graph      = Organization
-Governance = Company
-```
-
-or, end-to-end:
+ThinkToFinish (TTF) is the **Company Governance layer** above Oh My Hermes (OMH) and Hermes Agent. It deliberately does not rebuild the agent runtime, generic work orchestration, memory engine, executor router, worktree manager, or Kanban scheduler.
 
 ```text
 Owner / Chairman
-       │
-       ▼
-ThinkToFinish Company Layer
- Policy · Contracts · Evidence · Metrics
-       │
-       ▼
-Hermes Kanban Graph
-       │
- ┌─────┼───────────────┐
- ▼     ▼               ▼
-Agent  Agent           Agent
- │      │               │
-Loop   Loop            Loop
- └──────┼───────────────┘
-        ▼
- Integration → Review → Security → CI
-        │
-        ▼
-   Release Candidate
-        │
-  Human Gate for high-risk actions
-        │
-        ▼
-    Production
+      │
+      ▼
+ThinkToFinish Company Core
+WHAT + WHY
+Product Governance · Architecture Governance · Policy
+Task Contracts · Traceability · Risk/Approval · Release · Metrics
+      │
+      ▼
+Oh My Hermes (preferred Work Intelligence layer)
+HOW TO ORGANIZE WORK
+Interview · Research · Planning · Coordination · Coding-owner handoff
+Long-horizon workflows · Project memory · Execution observation · Adversarial QA
+      │
+      ▼
+Hermes Agent
+HOW TO RUN IT
+Profiles · Kanban · Goals/Loops · Native Review · Delegation
+Sessions · Plugins · Gateway · Worktrees/Sandbox
+      │
+      ▼
+Codex / Claude Code / pi / other coding owner
+HOW TO IMPLEMENT IT
 ```
 
-## What V0.1 provides
+The core rule is:
 
-### Portable Agent Plugin
+> **ThinkToFinish owns WHAT and WHY. OMH owns HOW TO ORGANIZE THE WORK. Hermes owns HOW TO RUN IT. The selected coding owner owns HOW TO IMPLEMENT IT.**
 
-The repo is an Agent Plugins v1 portable package:
+This boundary is intentional. Hermes and OMH evolve quickly; upstream capability growth should normally let ThinkToFinish **delete execution glue**, not add more of it.
+
+## What ThinkToFinish owns
+
+- Business goal and scope authority
+- Product Spec with stable requirement IDs and acceptance criteria
+- Architecture Contract, ADRs, Decision Packet, security boundaries
+- Company Task Contract / Definition of Done
+- Autonomous / human-approval / forbidden policy
+- Separation of duties and independent judgment
+- Requirement → ADR → Task → Commit → PR → Test → Release traceability
+- Integrated QA/Security company gate
+- Release Evidence and Release Candidate decision
+- Company metrics and governance learning
+
+## What ThinkToFinish does not own
+
+New projects must not depend on TTF implementations of:
+
+- Kanban scheduling or graph dispatch internals
+- generic Goal/Loop runtime
+- generic memory runtime
+- generic coding-executor routing
+- worktree management
+- Hermes session coordination
+- ordinary implementation review/rework transitions
+- direct mutation of Hermes `kanban.db`
+
+The existing deterministic transition engine is retained only as a **legacy-board compatibility fallback** for boards created before Hermes gained the native review/rework lifecycle. It is disabled by default for new projects.
+
+## Supported Work Layer
+
+The current TTF-supported OMH baseline is pinned in `policies/runtime-boundary.json`:
 
 ```text
-plugin.json
-mcp.json
-skills/
-server.py
+Oh My Hermes v1.0.6
+commit 0106a636d7c971408e9caf634b5e21a471fc5082
+channel stable
 ```
 
-Hermes loads the read-only namespaced skills and starts the local stdio MCP server. The MCP server has **zero third-party runtime dependencies**; Python 3.11+ is sufficient.
+TTF does not follow OMH `main` automatically. The same rule applies to Hermes: runtime upgrades are compatibility-tested before being promoted.
 
-### 11 company tools
+## Quick Start
 
-| Tool | Purpose |
-|---|---|
-| `ttf_company_status` | Company Layer status and principles |
-| `ttf_policy_check` | Autonomous / human approval / forbidden classification |
-| `ttf_validate_task_contract` | Validate task Definition of Done before execution |
-| `ttf_trace_node` | Record Requirement / ADR / Task / Commit / PR / Test / Release |
-| `ttf_trace_edge` | Link delivery evidence into a traceability graph |
-| `ttf_trace_query` | Inspect incoming/outgoing evidence links |
-| `ttf_trace_path` | Find an evidence path to a target artifact type |
-| `ttf_requirement_coverage` | Measure requirement coverage through delivery |
-| `ttf_release_gate` | Evaluate CI/test/review/security/traceability evidence |
-| `ttf_metrics_record` | Record terminal task metrics |
-| `ttf_metrics_summary` | Summarize company delivery/autonomy KPIs |
+Prerequisites:
 
-### Company skills
-
-- `company-orchestrator` — use Hermes Kanban as the macro graph; never implement production code from the orchestrator.
-- `product-discovery` — create stable requirement IDs and acceptance criteria.
-- `architecture-contract` — produce ADRs, boundaries, contracts, and verification plans.
-- `engineering-delivery` — implement in a worktree/branch, use an internal repair loop and deterministic gates, then leave a reviewed handoff.
-- `qa-release-gate` — independent review, security, traceability, and release-candidate evidence.
-
-### Mini-HRMS pilot
-
-A ready-to-run pilot goal is included under `examples/mini-hrms/` to prove the complete operating model on a bounded app:
-
-- Authentication
-- Employee management
-- Leave request/approval
-- HR / Manager / Employee RBAC
-- Basic audit log
-- Minimal dashboard
-- Payroll explicitly out of scope
-
-The expected endpoint is a **Release Candidate**, not an automatic production deployment.
-
----
-
-# Quick start
-
-## 1. Prerequisites
-
-You need:
-
-- Hermes Agent installed and configured with a working model/provider
-- Python 3.11+
+- Hermes Agent installed and configured
 - Git
-- A local Git project that Hermes may modify
+- Python 3.11+
+- `curl` for the pinned OMH installer
 
-Check your machine:
+Bootstrap the recommended stack:
+
+```bash
+./scripts/bootstrap-company.sh
+```
+
+This:
+
+1. installs the pinned stable OMH baseline,
+2. runs `omh setup` and `omh doctor`,
+3. creates/updates the ThinkToFinish Hermes Profiles,
+4. installs the portable TTF Company Core into those Profiles,
+5. runs the lightweight layered compatibility check.
+
+For a non-interactive or already-configured OMH host:
+
+```bash
+./scripts/bootstrap-company.sh --skip-omh-setup
+```
+
+To install only OMH:
+
+```bash
+./scripts/install-omh.sh
+```
+
+To inspect the local stack:
 
 ```bash
 ./scripts/doctor.sh
+./scripts/compatibility-check.sh
 ```
 
-If Hermes is not installed/configured yet, complete Hermes setup first.
+## Company Roles
 
-## 2. Bootstrap the AI company
+ThinkToFinish keeps company responsibility separate from generic workflow mechanics:
 
-From this repo:
+| Profile | Company authority |
+|---|---|
+| `orchestrator` | scope-aware company graph, routing, governance, closeout |
+| `product` | authoritative Product Spec, requirement IDs, acceptance criteria |
+| `architect` | authoritative ADRs/contracts/shared decisions/security boundaries |
+| `engineer` | delivery against a Company Task Contract; may use OMH/coding owners |
+| `qa-reviewer` | independent implementation review plus integrated QA/Security judgment |
+| `release-manager` | release evidence, traceability, residual risk, RC readiness |
 
-```bash
-./scripts/bootstrap-hermes.sh
-```
+OMH workflows are **capabilities used by these roles**, not replacement company authorities. For example, `ulw-interview` can strengthen Product Discovery, but its output is not authoritative until the `product` role turns it into the TTF Product Spec.
 
-This creates these Hermes Profiles if they do not already exist and installs their ThinkToFinish role charters:
+## Review Model
+
+New projects use **Hermes native same-card implementation review**:
 
 ```text
-orchestrator
-product
-architect
-engineer
-qa-reviewer
-release-manager
+Engineer implements + verifies
+        │
+        ▼
+kanban_request_review(reviewer="qa-reviewer")
+        │
+        ▼
+Hermes REVIEW
+   ┌────┴─────────┐
+approve       request_changes
+   │               │
+ done          original implementer
+                   │
+                   └──────→ review again
 ```
 
-It installs/enables ThinkToFinish Company Layer for each profile and for the default profile. It also installs a managed ThinkToFinish role-charter block into each specialist profile's `SOUL.md` without replacing other existing SOUL content.
+Use `kanban_block` only for a genuine external stop such as human approval, production/destructive action, security exception, or a required unavailable capability.
 
-The intended role separation is:
+Do **not** create a second pre-created review child for the same implementation phase while also using same-card review.
 
-| Profile | Responsibility |
-|---|---|
-| `orchestrator` | Understand goal, decompose, route, monitor, re-plan, escalate |
-| `product` | Research, requirements, Product Spec, acceptance criteria |
-| `architect` | Architecture, ADRs, API/data contracts, security boundaries |
-| `engineer` | Implementation, tests, repair loops, PR-ready evidence |
-| `qa-reviewer` | Independent review, regression, security, release readiness |
-| `release-manager` | CI/release evidence, RC coordination, production human gate |
+Separate downstream company gates remain first-class:
 
-**Important:** a Hermes Profile is an identity/state boundary, not a security sandbox. Use an isolated terminal backend/Codex sandbox and separate credentials for sensitive roles.
-
-## 3. Hermes Kanban setup
-
-The governed pilot does **not** require global Auto Decompose. It creates a dispatcher-spawned `orchestrator` kickoff card; Hermes automatically injects the task-scoped Kanban tools that let that worker create/link child cards. This avoids changing your global Kanban behavior.
-
-Optional: enable the **`kanban` toolset** on the `orchestrator` profile only if you also want ordinary interactive chats under that profile to inspect/route the board.
-
-Recommended engineering policy:
-
-- One Board = one project
-- Coding tasks use `worktree`
-- Goal mode is only for self-contained orchestration/research loops; engineering producers use normal cards and pre-created independent reviewer children
-- Reviewer is not the producer
-- No direct push to `main`
-- Production credentials are not available to `engineer`
-
-## 4. Prepare a pilot project
-
-Use an existing Git repo, or make a small empty one:
-
-```bash
-mkdir -p ~/Projects/mini-hrms
-cd ~/Projects/mini-hrms
-git init
-printf '# Mini HRMS\n' > README.md
-git add README.md
-git commit -m 'chore: initialize pilot'
+```text
+Product Spec
+    ↓
+Architecture Contract + Decision Packet
+    ↓
+Engineering Work Packages
+    ↓ native implementation review
+Integration
+    ↓ native implementation review
+Integrated QA + Security
+    ↓
+Release Evidence
+    ↓
+Company Closeout / RC decision
 ```
 
-## 5. Create the Mini-HRMS goal
+OMH may organize work inside an Engineering Work Package, but the Hermes Kanban board should not mirror every OMH internal substep card-for-card.
 
-From the `thinktofinish-company` repo:
+## Evidence Standard
+
+ThinkToFinish distinguishes prepared intent from observed evidence. A prepared plan, prepared coding handoff, green-looking status, or agent-reported completion does not prove execution or verification.
+
+The Company Evidence Graph is:
+
+```text
+Requirement → ADR → Task → Commit → PR → Test → Release
+```
+
+A Release Candidate normally requires:
+
+- acceptance criteria satisfied,
+- CI/tests verified,
+- independent review satisfied,
+- integrated security evidence accepted,
+- zero unresolved Critical/High findings under default policy,
+- traceability complete,
+- residual risks declared,
+- release policy satisfied.
+
+OMH QA success and Hermes task completion are useful evidence inputs, but neither alone is a TTF release decision.
+
+## Pilot
+
+Prepare a Git repository with at least one commit, then:
 
 ```bash
 ./scripts/create-pilot.sh ~/Projects/mini-hrms mini-hrms
 ```
 
-The script creates/switches the `mini-hrms` board, sets that board's default workdir to the target Git repo, and creates a **goal-mode orchestrator kickoff card**. If the target repo has no existing supported project context file, it also copies `templates/PROJECT_AGENTS.md` to the target as `AGENTS.md`; it never overwrites or auto-commits existing project instructions.
-
-The kickoff card creates Product → Architecture → a second orchestrator planning gate. That second orchestrator reads the actual upstream handoffs and builds the concrete Engineering DAG, QA/Security, Release Evidence, and Company Closeout cards. This staged graph is more governed than sending the raw product goal directly through generic Auto Decompose, while still using Hermes-native Kanban dependencies and Goal loops.
-
-## 6. Run the company
-
-Keep the Hermes gateway running:
-
-```bash
-hermes -p orchestrator gateway start
-```
-
-Open the dashboard:
-
-```bash
-hermes dashboard
-```
-
-You should see the kickoff orchestrator create the first staged dependency graph. After Product and Architecture finish, the second orchestrator card should wake and create the implementation/integration/review/release graph. Independent tasks may run in parallel; dependent tasks wait for parent handoffs.
-
-The intended pattern is:
+Expected high-level graph:
 
 ```text
-Kanban Graph = macro workflow
-Worker Loop  = bounded repair/verification workflow
+Product → Architecture → Engineering Work Packages
+                         ↓
+                    Integration
+                         ↓
+                   QA + Security
+                         ↓
+                  Release Evidence
+                         ↓
+                  Company Closeout
 ```
 
-For example, an engineering card should iterate:
+Implementation packages use native review loops internally rather than review-child/remediation graphs.
 
-```text
-Implement → test/gate → fail → diagnose → repair → retest → pass
-```
+## Runtime Boundary
 
-while the project graph coordinates:
+The machine-readable boundary is `policies/runtime-boundary.json`.
 
-```text
-Research → Product Spec → Architecture
-                      ├→ Backend ─┐
-                      ├→ Frontend ├→ Integration → Review → Security → RC
-                      └→ Data ────┘
-```
-
-### Deterministic Kanban transitions
-
-Enable the board-scoped transition engine after creating a pilot:
+CI enforces that the portable `thinktofinish_company/` core does not import Hermes internals or address Hermes Kanban SQLite storage directly:
 
 ```bash
-./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
+make boundary-check
 ```
 
-It installs one no-agent cron for that board only. Reviewers write a structured `ttf_review` verdict; on `changes_requested`, the engine creates a remediation/re-review pair, rewires downstream dependencies to the replacement review, refreshes completed approval gates that the new commit invalidates, and archives the rejected review as evidence. It rejects dirty Git handoffs, admits only one active transition per checkout, and replaces a deferred stale verdict with a runnable fresh-review card after an earlier remediation changes `HEAD`. After three rejected remediation or stale-review generations it creates one retained owner-input gate and leaves downstream work gated. It never approves a review, bypasses a typed human/capability gate, deploys, pushes `main`, or handles real credentials/PII.
+The intent is to keep runtime-specific integration thin. When Hermes changes, compatibility impact should be isolated to adapters/integration surfaces rather than Company Core semantics.
 
-When upgrading a board that still has a legacy handoff/governor cron, first migrate every reviewer profile to the structured verdict contract above, then take over explicitly:
+## Legacy Transition Engine
+
+`scripts/kanban-transition-engine.py` and its regression suite remain for migration support only.
+
+Do not enable it on a newly-created board. Existing boards that still encode the old `blocked + ttf_review + remediation child` protocol can be migrated separately after confirming their review state and evidence lineage.
+
+## Development
+
+Run the repository tests:
 
 ```bash
-./scripts/enable-kanban-autopilot.sh --profile orchestrator --replace-legacy mini-hrms
+make test
+make boundary-check
+make smoke
 ```
 
-The installer scans every Hermes profile, pauses each matching active legacy job, and converges duplicate/current jobs to one infinite no-agent cron. Each board gets its own atomically replaced engine copy, and a failed cron takeover restores the previous copy. Re-run the same command for each managed board after updating this plugin so that board's installed engine is refreshed.
-
----
-
-# Verify the Company Layer
-
-## Raw MCP smoke test
+Static layered compatibility check:
 
 ```bash
-python3 scripts/mcp-smoke.py
+./scripts/compatibility-check.sh --static
 ```
 
-Expected:
-
-```text
-MCP_SMOKE_OK 11
-```
-
-The smoke test checks both a legacy MCP initialization path and the current discovery path, lists tools, and verifies that production deployment is human-gated.
-
-## From Hermes
-
-In a profile where the plugin is enabled, ask Hermes to use the Company Layer, for example:
-
-```text
-Use the ThinkToFinish company tools and show company status.
-```
-
-Then try a policy decision:
-
-```text
-Check whether production_deployment with medium risk may proceed autonomously.
-```
-
-Expected decision: `human_approval`.
-
----
-
-# How to use the governance tools in a real project
-
-## 1. Validate a task contract
-
-Before a worker starts a meaningful engineering task, give it a contract such as:
-
-```yaml
-id: HRMS-EMP-014
-title: Implement Employee API
-goal: Enforce employee CRUD and RBAC from the approved Product Spec.
-inputs:
-  - PRD v1
-  - ADR-004
-outputs:
-  - production code
-  - unit tests
-  - integration tests
-acceptance_criteria:
-  - HR can create and update employees
-  - Manager can view only their team
-  - Employee can view self
-  - Unauthorized access returns 403
-verification:
-  - pytest tests/employees
-  - ruff check .
-  - mypy src
-risk: medium
-assignee_role: engineer
-review:
-  required: true
-  profile: qa-reviewer
-security:
-  required: true
-  profile: qa-reviewer
-traceability:
-  requirement_ids:
-    - HRMS-REQ-EMP-001
-```
-
-The worker/orchestrator should call `ttf_validate_task_contract` before execution.
-
-## 2. Check high-risk actions
-
-Before performing an action with business/security impact, call `ttf_policy_check`.
-
-Default V0.1 policy includes:
-
-**Autonomous**
-- research
-- requirements
-- product specification
-- architecture
-- coding/testing/documentation
-- branch/PR creation
-- staging deployment
-
-**Human approval**
-- production deployment
-- destructive DB migration
-- credential change
-- paid service purchase
-- major scope change
-- security exception
-- production DB write
-
-**Forbidden**
-- direct push to main
-- bypass required review
-- disable security controls
-- expose credentials
-
-A high/critical risk classification upgrades an otherwise autonomous action to a human approval gate.
-
-## 3. Build traceability as work completes
-
-Record nodes and links progressively:
-
-```text
-Requirement HRMS-REQ-LEAVE-001
-   ↓ implemented_by
-Task K-132
-   ↓ delivered_by
-PR #57
-   ↓ verified_by
-Test T-221
-   ↓ included_in
-Release v0.1.0-rc1
-```
-
-At release time, call `ttf_requirement_coverage`. A requirement is fully covered only when a path exists to **Task, PR, Test, and Release**.
-
-## 4. Run the release gate
-
-A release candidate requires evidence including:
-
-- CI = pass
-- tests = pass
-- independent review = approved
-- security review = pass
-- zero Critical findings
-- zero High findings
-- traceability complete
-- residual risks explicitly declared
-
-A production target additionally requires human approval for `production_deployment`.
-
-## 5. Record learning metrics
-
-Record terminal task metrics and use `ttf_metrics_summary` to watch:
-
-- Average cycle time
-- Average retries
-- Human interventions
-- Cost per completed workstream
-- First-pass rate
-- Autonomous Completion Rate
-
-The target over repeated projects is:
-
-```text
-Autonomous Completion ↑
-First-pass rate        ↑
-Cycle time             ↓
-Retries                ↓
-Human interventions    ↓
-Escaped defects        ↓
-```
-
----
-
-# Data and security
-
-## Where data is stored
-
-The portable MCP server receives a profile-scoped `PLUGIN_DATA` directory from Hermes. ThinkToFinish stores its SQLite evidence database there as `company.db`.
-
-When running `server.py` directly outside Hermes, it falls back to `.local-data/company.db` inside the repo.
-
-## Secrets
-
-Do **not** put credentials in:
-
-- `plugin.json`
-- `mcp.json`
-- task contracts
-- traceability metadata
-- release evidence
-- metric metadata
-
-Store identifiers/pointers and redacted summaries instead.
-
-## Profiles are not sandboxes
-
-Do not assume separate Hermes Profiles prevent filesystem access. For sensitive roles, use an isolated terminal backend such as Docker/cloud sandbox or the Codex workspace sandbox, and use role-specific credentials.
-
-## Production rule
-
-V0.1 deliberately ends the autonomous pilot at **Release Candidate**. Production deployment is human-gated by default.
-
----
-
-# Policy files
-
-Runtime policy source-of-truth in V0.1 is the JSON set:
-
-```text
-policies/company.json
-policies/autonomy.json
-policies/kanban-autopilot.json
-policies/quality.json
-policies/security.json
-```
-
-The adjacent `.yaml` files are human-readable mirrors/examples. If you customize policy in V0.1, update the JSON file used at runtime as well.
-
-This zero-dependency design is intentional so the portable MCP server can start from system Python without needing PyYAML or a package install.
-
----
-
-# Local development
-
-Run tests:
+Installed-stack check:
 
 ```bash
-PYTHONPATH=. python3 -m pytest -q
+./scripts/compatibility-check.sh
 ```
 
-Run MCP smoke test:
+## Design Principle
 
-```bash
-python3 scripts/mcp-smoke.py
+```text
+Hermes capability ↑
+        ↓
+TTF infrastructure code ↓
+        ↓
+TTF company intelligence ↑
 ```
 
-Run the server manually:
-
-```bash
-./scripts/run-mcp.sh
-```
-
-The server speaks JSON-RPC/MCP over stdio; normal log/protocol-unrelated text must never be printed to stdout.
-
----
-
-# Installing after this repo is published to GitHub
-
-Once the repo is hosted, each profile can install it through Hermes' normal plugin workflow:
-
-```bash
-hermes -p orchestrator plugins install OWNER/thinktofinish-company --enable
-hermes -p product plugins install OWNER/thinktofinish-company --enable
-hermes -p architect plugins install OWNER/thinktofinish-company --enable
-hermes -p engineer plugins install OWNER/thinktofinish-company --enable
-hermes -p qa-reviewer plugins install OWNER/thinktofinish-company --enable
-hermes -p release-manager plugins install OWNER/thinktofinish-company --enable
-```
-
-Until then, `scripts/install-local.sh` performs the equivalent local installation for this source tree.
-
----
-
-# V0.1 scope boundary
-
-V0.1 intentionally **does not** rebuild capabilities Hermes already owns:
-
-- No replacement graph scheduler/dispatcher; only a narrow deterministic review-transition reconciler
-- No custom Agent runtime
-- No custom worktree manager
-- No custom Goal loop
-- No new Kanban dashboard
-- No replacement memory/skill system
-
-Instead:
-
-> **Portable First, Native Only When Necessary.**
-
-Hermes Auto Decompose remains useful for ad-hoc Triage work. The default ThinkToFinish pilot deliberately uses a governed orchestrator kickoff plus a second post-architecture planning gate so contracts, review roles, and release gates are explicitly represented in the graph.
-
-Hermes owns Workforce + Workflow + Execution + Learning Infrastructure.
-ThinkToFinish owns Governance + Product Lifecycle + Evidence + Accountability.
-
-## Planned V0.2+
-
-Good next additions after V0.1 pilot evidence proves the need:
-
-1. Optional native Hermes hooks to ingest Kanban claimed/completed/blocked events automatically into company metrics.
-2. GitHub PR/CI evidence bridge to auto-link Task → Commit → PR → Checks.
-3. Company KPI dashboard tab for Autonomous Completion Rate, first-pass rate, retry/cost trends, and release readiness.
-4. Stronger release governance with signed evidence snapshots.
-5. Policy compiler so human-friendly YAML can become validated immutable runtime policy.
-
-Do not add these until the native Hermes + V0.1 pilot identifies a real gap.
-
----
-
-# Definition of success for the first pilot
-
-The AI Software Company V1 is working when one root goal can autonomously progress to a Release Candidate while demonstrating all of the following:
-
-1. Natural-language goal accepted.
-2. Goal decomposed into a dependency graph.
-3. Tasks routed to appropriate Profiles.
-4. Independent tasks run in parallel.
-5. Engineering changes use isolated branches/worktrees.
-6. Engineering loops continue until deterministic gates pass.
-7. Independent reviewer can reject and trigger repair.
-8. Security and CI evidence pass.
-9. Requirement → Task → PR → Test → Release traceability is complete.
-10. The Owner intervenes only for business/high-risk decisions.
-
-That is the first measurable step from **AI coding assistant** to **AI Software Company**.
+ThinkToFinish should remain valuable even if the execution runtime changes. Hermes is the preferred execution OS and OMH the preferred work-intelligence layer, but Company Policy, Product/Architecture authority, traceability, risk/approval, and release governance remain TTF concerns.

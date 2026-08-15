@@ -1,133 +1,260 @@
-# Architecture — Agent + Loop + Graph + Governance
+# Architecture — ThinkToFinish Company Core over OMH + Hermes
 
-## Boundary
+## 1. Architecture Decision
 
-ThinkToFinish Company Layer intentionally sits **above** Hermes. It does not own execution scheduling.
+ThinkToFinish is a **Company Governance Core**, not an alternative agent runtime and not a second generic orchestration framework.
 
 ```text
-┌────────────────────────────────────────────────────────────┐
-│ Owner / Chairman                                           │
-│ business goal · scope · high-risk approvals                │
-└──────────────────────────┬─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Owner / Chairman                                             │
+│ business goal · scope · high-risk approvals                  │
+└──────────────────────────┬───────────────────────────────────┘
                            ▼
-┌────────────────────────────────────────────────────────────┐
-│ ThinkToFinish Company Layer                                │
-│ Policy · Task Contract · Traceability · Release · Metrics  │
-└──────────────────────────┬─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ ThinkToFinish Company Core                                   │
+│ WHAT + WHY                                                   │
+│ Product · Architecture · Policy · Contracts · Traceability   │
+│ Risk/Approval · QA/Security Gate · Release · Company Metrics │
+└──────────────────────────┬───────────────────────────────────┘
                            ▼
-┌────────────────────────────────────────────────────────────┐
-│ Hermes Execution OS                                        │
-│ Profiles · Kanban · Goal Loop · Worktrees · Skills · CI    │
-└──────────────────────────┬─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ Oh My Hermes — preferred Work Intelligence Layer             │
+│ HOW TO ORGANIZE THE WORK                                     │
+│ Interview · Research · Plan · Work Coordination              │
+│ Coding-owner Handoff · Long-horizon Work · Memory · QA       │
+└──────────────────────────┬───────────────────────────────────┘
                            ▼
-                      Project artifacts
+┌──────────────────────────────────────────────────────────────┐
+│ Hermes Agent — Execution OS                                  │
+│ HOW TO RUN IT                                                │
+│ Profiles · Kanban · Goals/Loops · Native Review · Delegation │
+│ Sessions · Plugins · Gateway · Worktrees/Sandbox             │
+└──────────────────────────┬───────────────────────────────────┘
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Coding Owner                                                 │
+│ HOW TO IMPLEMENT IT                                          │
+│ Codex · Claude Code · pi · other explicit coding runtime     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-## Agent
+The key invariant is that every layer owns a different question. A lower layer may supply evidence or capability to a higher layer but may not silently acquire the higher layer's authority.
 
-Persistent Hermes Profiles are company roles. Each has a role charter in `SOUL.md` plus access to the portable Company Layer.
+## 2. Authority Matrix
+
+| Concern | Authority | Notes |
+|---|---|---|
+| Business goal/scope | TTF | high-impact changes follow Company Policy |
+| Product Spec / requirement IDs | TTF product role | OMH interview/research can support it |
+| ADRs / Architecture Contract | TTF architect role | OMH research/planning can support it |
+| Company Task Contract | TTF | cannot be weakened by a work/executor layer |
+| Generic interview/research workflow | OMH preferred | evidence input, not product authority |
+| Work coordination / coding-owner handoff | OMH preferred | keep prepared vs observed boundary |
+| Profiles/Kanban/Goals/Loops | Hermes | TTF must not rebuild scheduler/runtime internals |
+| Implementation review lifecycle | Hermes native | same-card review/rework |
+| Implementation | selected coding owner | Codex/Claude/pi/etc. |
+| Integrated QA/Security company judgment | TTF QA role | may consume OMH QA evidence |
+| Requirement traceability | TTF | Requirement → ADR → Task → Commit → PR → Test → Release |
+| Release Candidate decision | TTF release governance | CI/OMH/Hermes status are evidence inputs only |
+| Production approval | authorized human | default policy gate |
+
+## 3. Company Roles
+
+Persistent Hermes Profiles remain useful company identities, but Profile isolation must not be confused with a security sandbox.
 
 ```text
-orchestrator    → decomposition, routing, replanning, closeout
-product         → requirements and Product Spec
-architect       → ADRs, contracts, technical boundaries
-engineer        → implementation and deterministic verification
-qa-reviewer     → independent judgment and security review
-release-manager → evidence aggregation and release readiness
+orchestrator    → company phase graph, governance, closeout
+product         → Product Spec / requirements / acceptance criteria
+architect       → ADRs / Decision Packet / contracts / boundaries
+engineer        → Company Task Contract delivery
+qa-reviewer     → native implementation review + independent QA/security judgment
+release-manager → release evidence / residual risk / RC readiness
 ```
 
-## Loop
+Role identity lives in the TTF charter. Generic planning, interview, memory, work coordination, and executor selection should use OMH/Hermes capabilities rather than be reimplemented in each charter.
 
-A meaningful engineering card is a micro loop:
+## 4. Product and Architecture Authority
+
+### Product phase
+
+OMH `ulw-interview` and `ulw-research` are useful supporting capabilities, but the authoritative output is a TTF Product Spec containing at least:
+
+- problem and target users,
+- goals/non-goals,
+- stable requirement IDs,
+- acceptance criteria,
+- roles/permissions,
+- non-functional requirements,
+- risks and assumptions,
+- phase boundaries.
+
+### Architecture phase
+
+OMH research/planning may help compare alternatives, but the authoritative architecture artifact is a TTF Architecture Contract containing:
+
+- ADR IDs,
+- component and ownership boundaries,
+- API/data contracts,
+- auth/security model,
+- failure/operational behavior,
+- deterministic verification plan,
+- Decision Packet for shared parallel-work decisions,
+- residual risks.
+
+Shared decisions must be stable before wide engineering fan-out.
+
+## 5. Engineering Boundary
+
+A meaningful engineering unit begins from a validated Company Task Contract.
+
+TTF owns:
 
 ```text
-Task Contract
-     ↓
- Implement
-     ↓
- deterministic gate
-   ┌─┴─────────┐
- PASS         FAIL
-   │            ↓
-   │         diagnose
-   │            ↓
-   │          repair
-   │            └──────→ gate
-   ▼
- handoff evidence
+Goal
+Inputs
+Outputs
+Acceptance Criteria
+Verification
+Risk
+Assignee/Review expectations
+Security expectations
+Requirement IDs
 ```
 
-Use the worker's internal repair loop for code producers, then complete a normal card into an independent reviewer child. Reserve Hermes goal-mode for self-contained orchestration/research cards whose completion does not depend on that downstream review.
+OMH may then organize execution, choose/prepare a coding-owner handoff, coordinate independent lanes, maintain bounded project memory, and observe execution.
 
-## Graph
+Hermes owns runtime mechanics: Kanban, Profiles, session control, delegation, worktrees, Goals/Loops, and review status.
 
-Kanban is the macro workflow. Dependencies are durable edges; independent cards may run in parallel.
+The coding owner edits code and runs implementation verification.
 
-The V0.1 pilot deliberately stages graph creation:
+## 6. Native Review Model
+
+New TTF projects use Hermes native same-card implementation review:
 
 ```text
-Kickoff Orchestrator
-        │
-        ▼
+running implementation
+        ↓
+kanban_request_review(reviewer="qa-reviewer")
+        ↓
+review
+  ├─ approve → done
+  └─ request_changes → original implementer → review
+```
+
+`blocked` is reserved for genuine external/safety stops, not ordinary review feedback.
+
+Do not combine same-card review with a pre-created review child for the same implementation phase. Dedicated downstream QA/Security or Release cards are different company phases and remain separate cards.
+
+The old TTF deterministic transition engine is retained only for compatibility with boards created under the pre-native review protocol. It is disabled by default.
+
+## 7. Macro Company Graph
+
+Kanban remains the macro company graph, but TTF should create **company-sized work packages**, not mirror every OMH workflow step.
+
+```text
 Product Spec
-        │
-        ▼
-Architecture
-        │
-        ▼
-Engineering Graph Planner (Orchestrator)
-   ┌────────┼───────────┐
-   ▼        ▼           ▼
- BE/API   FE/UI      Data/Auth
-   ▼        ▼           ▼
- Review   Review      Review
-   └────────┼───────────┘
-            ▼
-       Integration
-            ▼
-    Integration Review
-            ▼
-       QA + Security
-        ▼
- Release Evidence
-        ▼
- Company Closeout
+      ↓
+Architecture Contract + Decision Packet
+      ↓
+Engineering Work Packages (2–4 where parallelism is real)
+      ↓
+Integration
+      ↓
+Integrated QA + Security
+      ↓
+Release Evidence
+      ↓
+Company Closeout / RC decision
 ```
 
-The second orchestrator wakes **after architecture** so it can create implementation cards from real contracts instead of guessing them at project intake.
+Each implementation/integration package can contain an OMH work process internally and uses Hermes native review.
 
-## Governance
+This prevents orchestration nesting such as TTF cards reproducing OMH task lists which themselves reproduce Hermes delegation children.
 
-Every important action is one of:
+## 8. Evidence Model
 
-```text
-autonomous      → proceed within contract
-a human approval → block/escalate until explicit decision
-forbidden        → do not execute
-```
+TTF distinguishes three concepts:
 
-Task Contracts define what “done” means. Traceability proves why each artifact exists. Release Evidence determines whether delivery is ready. Metrics tell whether autonomy is improving without sacrificing quality.
+1. **Prepared intent** — plan, handoff, contract, expected verification.
+2. **Observed execution evidence** — actual commit, PR, test/CI receipt, review receipt, runtime observation.
+3. **Company decision evidence** — policy decision, traceability coverage, residual risk acceptance, release gate outcome.
 
-## Evidence Graph
+Prepared work never automatically upgrades itself to observed evidence.
+
+Company Evidence Graph:
 
 ```text
 Requirement → ADR → Task → Commit → PR → Test → Release
 ```
 
-V0.1 coverage requires each requirement to have a path to Task, PR, Test, and Release.
+A release decision can consume OMH/Hermes evidence but TTF remains the authority that decides whether coverage and policy are sufficient.
 
-## Security boundary
+## 9. Security Boundaries
 
-Profiles are not filesystem sandboxes. Security relies on:
+Profiles are identities/state boundaries, not full filesystem sandboxes.
 
-- least-privilege role credentials
-- isolated worktrees / sandboxed terminal runtime where appropriate
-- no production credentials for engineering workers
-- human gates for production/destructive/security-exception actions
-- independent review
-- explicit release evidence
-- metadata secret-redaction as defense in depth
+TTF security relies on:
 
-## Why portable-first
+- least-privilege credentials per role,
+- effective sandbox/worktree isolation where required,
+- no production credentials for engineering workers,
+- no secrets in durable task/evidence metadata,
+- human gates for production/destructive/security-exception actions,
+- independent judgment,
+- explicit Release Evidence.
 
-Portable Agent Plugin components give the Company Layer reusable skills and MCP tools without patching Hermes core. Native Hermes hooks should be added only when a measured gap requires automatic lifecycle ingestion or privileged deterministic enforcement.
+Requested isolation is not sufficient; the effective execution environment must be observable when security depends on it.
+
+## 10. Runtime Boundary Contract
+
+`policies/runtime-boundary.json` is the machine-readable source of truth for layer ownership.
+
+The portable `thinktofinish_company/` package must not:
+
+- import `hermes_cli` internals,
+- depend on `kanban_db`,
+- open Hermes Kanban SQLite directly,
+- become a generic memory/executor/scheduler runtime.
+
+`scripts/runtime-boundary-check.py` enforces the most important static parts of this contract.
+
+Runtime-specific integration should be concentrated in a thin adapter/bridge when native lifecycle events or capability provisioning are necessary.
+
+## 11. Upgrade Governance
+
+Neither OMH nor Hermes `main` is a production/company baseline.
+
+Recommended channels:
+
+```text
+Preview     → upstream main; compatibility observation only
+Candidate   → pinned release/commit that passed TTF compatibility tests
+Supported   → explicitly promoted runtime baseline
+```
+
+OMH is currently pinned to the stable v1.0.6 release commit in `runtime-boundary.json`.
+
+The desired response to upstream feature growth is:
+
+```text
+upstream capability appears
+        ↓
+compatibility suite evaluates it
+        ↓
+if it replaces TTF execution glue safely
+        ↓
+delete/retire duplicated TTF infrastructure
+```
+
+Company Core semantics should change only when company-governance requirements change, not because Hermes reorganized an internal database or dispatcher.
+
+## 12. Design Test
+
+For any proposed TTF feature ask:
+
+1. Is this deciding WHAT/WHY, policy, accountability, evidence sufficiency, or release authority? → probably TTF.
+2. Is this generic interviewing/planning/work coordination/memory/executor handoff? → prefer OMH.
+3. Is this scheduling/session/delegation/review/worktree/runtime behavior? → Hermes.
+4. Is this code implementation? → coding owner.
+
+If two layers would both own the same lifecycle transition, stop and simplify the design before adding code.

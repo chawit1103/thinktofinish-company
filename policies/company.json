@@ -4,19 +4,27 @@
     "owner_role": "Owner / Chairman"
   },
   "principles": [
-    "Agent = Capability",
-    "Loop = Reliability",
-    "Graph = Organization",
-    "Governance = Company",
+    "ThinkToFinish owns WHAT and WHY",
+    "Oh My Hermes owns HOW TO ORGANIZE WORK when available",
+    "Hermes owns HOW TO RUN IT",
+    "Coding owners own HOW TO IMPLEMENT IT",
+    "Governance remains above runtime",
+    "Prepared intent is not observed evidence",
     "Portable First, Native Only When Necessary",
+    "Upstream capability growth should reduce duplicated ThinkToFinish execution glue",
     "Technical decisions may be autonomous within policy; business and high-risk decisions escalate to humans"
   ],
   "operating_model": {
     "project_isolation": "one_board_per_project",
-    "engineering_workspace": "worktree",
+    "company_graph": "macro_phases_only",
+    "work_intelligence": "oh-my-hermes_preferred",
+    "engineering_workspace": "effective_isolation_required",
+    "implementation_review": "hermes_native_same_card_review",
     "direct_push_to_main": false,
     "pull_request_required": true,
     "independent_review_required": true,
-    "production_human_gate": true
+    "integrated_qa_security_required": true,
+    "production_human_gate": true,
+    "legacy_transition_engine_default": false
   }
 }

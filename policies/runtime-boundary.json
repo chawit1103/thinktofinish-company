@@ -1,0 +1,39 @@
+{
+  "schema": "ttf_runtime_boundary/v1",
+  "company_core": {
+    "owns": ["business_goal", "product_spec", "requirement_ids", "architecture_contract", "company_policy", "task_contract", "risk_and_approval", "traceability", "release_governance", "company_metrics"],
+    "must_not_own": ["agent_runtime", "kanban_scheduler", "generic_goal_loop", "generic_memory_runtime", "generic_executor_router", "worktree_manager", "direct_kanban_database_mutation"]
+  },
+  "work_layer": {
+    "preferred": "oh-my-hermes",
+    "channel": "stable",
+    "version": "1.0.6",
+    "commit": "0106a636d7c971408e9caf634b5e21a471fc5082",
+    "wheel_sha256": "30daee80ab091e1de2af30b290b4e4f089eaa813d7e9a243bac151aae3a3b888",
+    "follow_main": false,
+    "owns": ["interview", "research_workflow", "planning_workflow", "work_coordination", "coding_owner_selection", "coding_handoff", "long_horizon_workflow", "project_memory_workflow", "execution_observation", "adversarial_qa_workflow"]
+  },
+  "execution_runtime": {
+    "preferred": "hermes-agent",
+    "upgrade_policy": "pinned_and_compatibility_tested",
+    "follow_main": false,
+    "owns": ["profiles", "kanban", "goal_and_loop_runtime", "native_review_lifecycle", "delegation", "sessions", "plugins", "sandbox_and_worktrees", "gateway_and_cron"]
+  },
+  "coding_owners": {
+    "examples": ["codex", "claude-code", "pi"],
+    "owns": ["implementation", "code_changes", "implementation_verification", "review_fixes"]
+  },
+  "review": {
+    "implementation_review": "hermes_native_same_card_review",
+    "changes_requested": "hermes_native_request_changes",
+    "company_gates": ["independent_qa_security", "release_evidence"],
+    "block_reserved_for": ["human_approval", "security_exception", "production_or_destructive_action", "missing_required_capability"]
+  },
+  "legacy": {
+    "kanban_transition_engine": {
+      "enabled_by_default": false,
+      "purpose": "compatibility fallback for boards created before Hermes native review/rework lifecycle",
+      "new_projects_must_not_depend_on_it": true
+    }
+  }
+}
