@@ -118,6 +118,152 @@ To inspect the local stack:
 ./scripts/compatibility-check.sh
 ```
 
+## Fresh Ubuntu Machine
+
+For a clean Ubuntu machine, **Ubuntu 24.04 LTS or newer is recommended** because ThinkToFinish requires Python 3.11+ and Ubuntu 24.04 ships a sufficiently new system Python. Ubuntu 22.04 can still be used, but its default Python 3.10 does not satisfy the TTF prerequisite without an additional Python installation.
+
+Do not run Hermes, OMH, or TTF setup commands with `sudo`. Use `sudo` only for OS package installation.
+
+### 1. Install base OS packages
+
+```bash
+sudo apt update
+sudo apt install -y git curl ca-certificates
+```
+
+Confirm the local tools:
+
+```bash
+git --version
+curl --version
+python3 --version
+```
+
+`python3 --version` must report **3.11 or newer** for the TTF scripts.
+
+### 2. Install Hermes Agent
+
+Use the official Hermes Linux installer:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+```
+
+Reload the shell environment:
+
+```bash
+source ~/.bashrc
+```
+
+Then configure Hermes and verify the installation:
+
+```bash
+hermes setup
+hermes doctor
+hermes --version
+```
+
+The Hermes installer manages its own runtime dependencies. TTF still checks the host `python3` because its bootstrap, compatibility, and MCP smoke scripts execute with the system Python.
+
+### 3. Clone ThinkToFinish
+
+```bash
+mkdir -p ~/Projects
+cd ~/Projects
+git clone https://github.com/chawit1103/thinktofinish-company.git
+cd thinktofinish-company
+```
+
+### 4. Bootstrap the complete stack
+
+For a new test machine, run the full bootstrap including the OMH/Hermes smoke test:
+
+```bash
+./scripts/bootstrap-company.sh --omh-smoke
+```
+
+The bootstrap will:
+
+```text
+Hermes already installed/configured
+        ↓
+Install pinned OMH v1.0.6
+        ↓
+OMH setup + doctor + Hermes smoke
+        ↓
+Create/update TTF company Profiles
+        ↓
+Install TTF Company Core in each Profile
+        ↓
+Run layered compatibility checks
+```
+
+`omh setup` may ask about model/provider aliases. Review those choices rather than blindly replacing an existing Hermes model configuration.
+
+### 5. Verify all three layers
+
+```bash
+hermes --version
+omh --version
+omh doctor
+./scripts/doctor.sh
+./scripts/compatibility-check.sh
+```
+
+A successful layered check ends with:
+
+```text
+TTF_COMPATIBILITY_OK
+```
+
+If OMH installed successfully but `omh` is not found, start a new shell first. The TTF installer also probes common locations such as `~/.local/bin`.
+
+### 6. Optional: create a disposable pilot project
+
+```bash
+mkdir -p ~/Projects/mini-hrms
+cd ~/Projects/mini-hrms
+git init
+git config user.name "TTF Pilot"
+git config user.email "ttf-pilot@localhost"
+printf '# Mini HRMS\n' > README.md
+git add README.md
+git commit -m 'chore: initialize pilot'
+
+cd ~/Projects/thinktofinish-company
+./scripts/create-pilot.sh ~/Projects/mini-hrms mini-hrms
+```
+
+Then inspect the board/runtime:
+
+```bash
+hermes dashboard
+```
+
+or start an orchestrator gateway if you want the persistent Hermes runtime:
+
+```bash
+hermes -p orchestrator gateway start
+```
+
+For a first Ubuntu validation, keep the pilot disposable and avoid production credentials or real employee/customer data.
+
+### Ubuntu upgrade / re-test flow
+
+After later updates to Hermes or TTF:
+
+```bash
+hermes update
+
+cd ~/Projects/thinktofinish-company
+git switch main
+git pull
+./scripts/bootstrap-company.sh --skip-omh-setup --omh-smoke
+./scripts/compatibility-check.sh
+```
+
+This keeps OMH on the TTF-supported pinned baseline instead of silently following OMH `main`.
+
 ## Company Roles
 
 ThinkToFinish keeps company responsibility separate from generic workflow mechanics:
