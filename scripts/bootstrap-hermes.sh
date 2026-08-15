@@ -88,19 +88,23 @@ create_profile() {
   install_charter "$name"
 }
 
-create_profile orchestrator "Coordinates goals through Hermes Kanban; decomposes, routes, monitors, replans, and applies ThinkToFinish governance. Does not implement production code."
-create_profile product "Researches users, market, requirements, and produces product specifications with stable requirement IDs and acceptance criteria."
-create_profile architect "Creates implementation-ready architecture, ADRs, data/API contracts, security boundaries, and verification plans."
-create_profile engineer "Implements scoped software tasks in worktrees, writes tests, runs quality gates, and produces PR-ready evidence."
-create_profile qa-reviewer "Independently reviews changes, regression evidence, acceptance criteria, security posture, and release readiness."
-create_profile release-manager "Assembles release evidence, checks CI and traceability, coordinates release candidates, and stops at production human gates."
+create_profile orchestrator "Owns ThinkToFinish company governance and macro delivery phases; coordinates through OMH/Hermes but does not implement production code."
+create_profile product "Owns the authoritative Product Spec, stable requirement IDs, scope, risks, and acceptance criteria; may use OMH interview/research as supporting capabilities."
+create_profile architect "Owns authoritative ADRs, architecture contracts, shared decisions, security boundaries, and verification plans; may use OMH research/planning as support."
+create_profile engineer "Owns a governed Company Task Contract; uses OMH/coding owners for execution where appropriate and Hermes native same-card review."
+create_profile qa-reviewer "Independent implementation reviewer and integrated QA/security judge; uses Hermes native review lifecycle and may consume OMH QA evidence."
+create_profile release-manager "Assembles company release evidence, checks CI/security/traceability/residual risk, and stops at production human gates."
 
-# Enable the portable layer in the default profile too, useful for interactive control.
+# Enable the portable Company Core in the default profile for interactive governance.
 HERMES_HOME="$SHARED_HOME" "$ROOT/scripts/install-local.sh" --profile default
 
 echo
-echo "Profiles created and Company Layer installed."
+echo "ThinkToFinish Company Core profiles installed."
+if command -v omh >/dev/null 2>&1; then
+  echo "OMH Work Intelligence detected: $(omh --version 2>/dev/null || echo installed)"
+else
+  echo "OMH is not on PATH. Recommended: $ROOT/scripts/install-omh.sh"
+fi
 echo "Next: create a board with scripts/create-pilot.sh /absolute/path/to/project"
-echo "Then start the gateway: hermes -p orchestrator gateway start"
-echo "No global Kanban settings were changed. The pilot uses a dispatcher-spawned orchestrator card, so Kanban task tools are injected automatically."
-echo "Optional: enable the 'kanban' toolset on the orchestrator profile only if you want interactive orchestrator chats to route board work."
+echo "Then start/keep the gateway: hermes -p orchestrator gateway start"
+echo "New projects use Hermes native review/rework. The legacy TTF transition engine is not enabled by default."

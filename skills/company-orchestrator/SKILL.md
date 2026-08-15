@@ -1,51 +1,46 @@
 ---
 name: company-orchestrator
-description: Orchestrate governed delivery with Hermes Kanban.
-version: 0.2.0
+description: Govern software delivery above OMH work intelligence and Hermes execution.
+version: 0.3.0
 author: ThinkToFinish
 license: MIT
-compatibility: Hermes Agent with Kanban and ThinkToFinish Company MCP tools enabled.
+compatibility: Hermes Agent with ThinkToFinish Company MCP tools; Oh My Hermes recommended.
 metadata:
-  category: orchestration
+  category: governance
   layer: company
 ---
 # Company Orchestrator
 
 ## When to Use
-Use when a user gives a product or software outcome rather than a single implementation task, for example "build a mini HRMS" or "ship feature X end to end".
+Use when a user gives a product/software outcome rather than a single implementation task, for example "build a mini HRMS" or "ship feature X end to end".
 
-## Operating Model
-Treat Hermes as the execution OS and this skill as company governance.
+## Layer Contract
 
-- **Agent = Capability**: route work to the best profile.
-- **Loop = Reliability**: use bounded internal repair loops; reserve goal-mode for self-contained orchestration/research work.
-- **Graph = Organization**: use Kanban dependencies for macro workflow and parallelism.
-- **Governance = Company**: call `ttf_policy_check`, validate contracts, preserve traceability, and enforce release evidence.
+- **ThinkToFinish = WHAT + WHY**: company scope, authoritative Product/Architecture artifacts, Task Contracts, policy, traceability, QA/Security judgment, release governance, metrics.
+- **Oh My Hermes = HOW TO ORGANIZE WORK** when available: interview, research, planning, coordination, coding-owner handoff, long-horizon work, project memory, execution observation, adversarial QA.
+- **Hermes = HOW TO RUN IT**: Profiles, Kanban, Goals/Loops, native review/rework, delegation, sessions, plugins, gateway, worktrees/sandbox.
+- **Coding owner = HOW TO IMPLEMENT IT**.
 
 ## Procedure
-1. Identify the project/board. One independent software project should use one Hermes Kanban board.
-2. Convert the user's goal into a small product-delivery graph. Prefer native Triage Auto Decompose when appropriate; do not build a parallel scheduler.
-3. Before creating high-value implementation cards, express each as a Company Task Contract and call `ttf_validate_task_contract`.
-4. Route technical work to profiles by capability. The orchestrator should coordinate, not implement production code.
-5. Use `goal_mode=True` only for an orchestration/research card whose completion does not depend on a downstream child. Code producers that hand off to an independent review use normal cards: their terminal outcome is a verified commit handoff.
-6. Use worktree workspaces for coding tasks. Require PR/CI for integration.
-7. Record traceability as artifacts appear: requirement → task → commit → PR → test → release.
-8. Run independent review and security review before release evidence is accepted.
-9. Before any risky action call `ttf_policy_check`. Stop for human approval when the result is `human_approval`; never perform `forbidden` actions.
-10. Call `ttf_release_gate` before declaring a release candidate ready.
-11. Record metrics at terminal task outcomes so the company can learn across projects.
+1. Identify the project/board. One independent software project should normally use one Hermes Kanban board.
+2. Create only the company-sized macro phases needed for the outcome; do not build a parallel scheduler or mirror every OMH substep in Kanban.
+3. Product and Architecture phases may call OMH capabilities, but their authoritative outputs remain TTF Product Spec / Architecture Contract.
+4. Before high-value implementation, require a Company Task Contract and call `ttf_validate_task_contract`.
+5. Route implementation to `engineer`; OMH may organize or prepare an explicit coding-owner handoff within that work package.
+6. Use Hermes native same-card implementation review with a separate reviewer identity. Do not pre-create another review child for the same phase.
+7. Keep integrated QA/Security and Release Evidence as separate downstream company gates.
+8. Record traceability as real artifacts appear: requirement → ADR → task → commit → PR → test → release.
+9. Call `ttf_policy_check` before risky actions; stop for `human_approval` and never perform `forbidden` actions.
+10. Call `ttf_release_gate` before declaring a Release Candidate ready and record terminal company metrics.
 
-## Orchestration Rules
-- Prefer 2-6 meaningful tasks per decomposition; avoid dozens of tiny cards.
-- Parallelize only genuinely independent work.
-- Downstream cards must receive structured handoff evidence, not "done" prose.
-- A producer cannot be the only judge of its own output.
-- Pre-create a read-only reviewer child for every code producer. A `review-required:` handoff completes the producer and promotes that child; never mark review waiting as `blocked`.
-- QA/security and release gates depend on the approved integration reviewer child, never the integration producer directly.
-- A reviewer `changes_requested` verdict creates one remediation producer and its reviewer child automatically. Preserve failed cards as evidence; do not require an operator to repair ordinary graph transitions.
-- Reserve retained `blocked` states for a human gate, a real safety boundary, or an unavailable required capability after safe alternatives. An untyped review block may briefly trigger deterministic remediation; dependency waits and routine tool approval timeouts are not human-input blocks.
-- Do not expose secrets in Kanban metadata or traceability metadata.
-- Business scope, production deployment, destructive migrations, paid purchases, credentials, and security exceptions are human-gated by policy.
+## Rules
+- Prefer 2–6 meaningful company work packages, not dozens of micro-cards.
+- Parallelize only genuinely independent work and stabilize shared decisions first.
+- Prepared plans/handoffs are not observed execution evidence.
+- `kanban_block` is for a real human/safety/capability stop, not review waiting or ordinary rework.
+- The legacy TTF transition engine is not a normal path for new projects.
+- Never expose secrets in Kanban/traceability/release metadata.
+- Production, destructive migrations, credentials, paid purchases, major scope changes, production DB writes, and security exceptions are human-gated by policy.
 
 ## Completion Standard
-A project is not complete because implementation cards are green. It is complete when required acceptance criteria, CI, independent review, security evidence, traceability, and release policy are all satisfied.
+A project is not complete because implementation cards or OMH workflows are green. It is complete at the requested company boundary only when acceptance criteria, deterministic evidence, independent judgment, security evidence, traceability, residual risk, and release policy are satisfied.

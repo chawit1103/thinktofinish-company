@@ -1,108 +1,200 @@
-# Mini-HRMS Pilot Runbook
+# Mini HRMS Pilot Runbook — Company Core + OMH + Hermes
 
 ## Objective
 
-Prove that one owner goal can progress through Agent + Loop + Graph + Governance to a Release Candidate with minimal human intervention.
+Prove that ThinkToFinish can take a business-level goal to a governed Release Candidate while keeping authority boundaries clean:
 
-## Before launch
+- TTF owns company requirements, architecture, policy, traceability, QA/Security judgment, and release decision.
+- OMH organizes work when useful.
+- Hermes runs Profiles/Kanban/Goals/Loops/native review/delegation/workspaces.
+- Coding owners implement code.
+
+## 1. Bootstrap
+
+Install/configure the recommended stack:
+
+```bash
+./scripts/bootstrap-company.sh
+```
+
+Verify:
 
 ```bash
 ./scripts/doctor.sh
-./scripts/bootstrap-hermes.sh
+./scripts/compatibility-check.sh
 ```
 
-Prepare a Git repo with at least one commit. Confirm the Hermes model/provider works in each profile you intend to use.
+The runtime boundary check should report OMH pinned to the supported stable baseline and the legacy TTF transition engine disabled by default.
 
-## Launch
+## 2. Prepare Project
 
 ```bash
-./scripts/create-pilot.sh /absolute/path/to/mini-hrms mini-hrms
-./scripts/enable-kanban-autopilot.sh --profile orchestrator mini-hrms
-hermes -p orchestrator gateway start
-hermes dashboard
+mkdir -p ~/Projects/mini-hrms
+cd ~/Projects/mini-hrms
+git init
+printf '# Mini HRMS\n' > README.md
+git add README.md
+git commit -m 'chore: initialize pilot'
 ```
 
-The pilot script sets the board's default workdir to the Git repo. Hermes can therefore keep task work isolated in project workspaces/worktrees.
+## 3. Create Company Board
 
-## Expected graph evolution
-
-### Phase A — intake
-
-`Orchestrate Mini HRMS to Release Candidate` runs under `orchestrator`.
-
-It should create:
-
-1. Product Discovery / Product Spec (`product`)
-2. Architecture Contract (`architect`, parent=Product)
-3. Engineering Graph Planner (`orchestrator`, parent=Architecture)
-
-The kickoff then completes.
-
-### Phase B — engineering graph
-
-After Architecture completes, the second orchestrator reads upstream handoffs and should create:
-
-- 2–4 scoped implementation producer cards (`engineer`) where parallelism is safe, each with a pre-created read-only reviewer child (`qa-reviewer`)
-- Integration producer, parented on approved implementation reviews, with its own pre-created reviewer child
-- Independent QA/Security card (`qa-reviewer`), parent=approved Integration reviewer child
-- Release Evidence card (`release-manager`), parent=QA/Security
-- Company Closeout card (`orchestrator`), parent=Release Evidence
-
-Implementation producers use normal Kanban cards, not goal-mode: their terminal outcome is a verified `review-required:` commit handoff. Goal-mode is reserved for an orchestration/research card whose completion does not depend on a downstream child.
-
-The board-scoped transition engine reads structured reviewer verdicts. A `changes_requested` verdict creates a remediation/re-review pair, rewires downstream dependencies to the new review, refreshes completed approval gates invalidated by the new commit, and archives the rejected review as evidence. It permits one active transition per Git checkout and automatically replaces a deferred stale verdict with a fresh-review card. Three rejected remediation or stale-review generations trigger one retained owner-input gate while downstream work remains gated. Typed `needs_input` and `capability` blocks are never automated.
-
-For a legacy board, migrate every reviewer profile to the `ttf_review` contract before takeover, then run `./scripts/enable-kanban-autopilot.sh --profile orchestrator --replace-legacy mini-hrms`. This pauses matching active legacy graph jobs across every Hermes profile. Re-run it after plugin updates to refresh the board's installed engine copy.
-
-### Phase C — release closeout
-
-The final orchestrator must check:
-
-- requirement coverage
-- CI and test evidence
-- independent review
-- security status
-- residual risks
-- release gate result
-
-The expected terminal state is **Release Candidate Ready**, not production deployed.
-
-## What the owner should intervene on
-
-Intervene only for a real blocker or policy gate such as:
-
-- major scope change
-- destructive migration
-- credential change
-- paid service purchase
-- production database write
-- security exception
-- production deployment
-
-Technical choices inside approved scope should normally remain autonomous.
-
-## What to watch
+From the TTF repo:
 
 ```bash
-hermes kanban --board mini-hrms list
-hermes kanban --board mini-hrms watch
-hermes kanban --board mini-hrms diagnostics
+./scripts/create-pilot.sh ~/Projects/mini-hrms mini-hrms
 ```
 
-In the dashboard, inspect Run History and completion metadata rather than trusting final prose.
+The script sets the board's default workdir to the project Git repository.
 
-## Pilot scorecard
+## 4. Expected Staged Graph
 
-A successful V0.1 run demonstrates:
+The kickoff orchestrator creates only the early governance stages first:
 
-- root goal accepted once
-- staged graph created without manual task-by-task prompting
-- correct role routing
-- dependency-aware parallelism
-- repair loops on implementation failures
-- producer/reviewer separation
-- requirement traceability
-- release evidence gate
-- human intervention only at legitimate policy gates
+```text
+Kickoff
+   ↓
+Product Spec
+   ↓
+Architecture Contract + Decision Packet
+   ↓
+Engineering Work Planner
+```
 
-After the run, ask the Company Layer for `ttf_metrics_summary(project="mini-hrms")` and record what required manual intervention. Those gaps determine V0.2 work.
+The second orchestrator reads actual Product/Architecture evidence before creating engineering packages.
+
+Expected macro graph:
+
+```text
+Product
+  ↓
+Architecture
+  ↓
+Engineering Work Packages
+  ↓
+Integration
+  ↓
+Integrated QA + Security
+  ↓
+Release Evidence
+  ↓
+Company Closeout
+```
+
+Do not expand every OMH sub-work item into a parallel Kanban graph.
+
+## 5. Product Phase
+
+The `product` Profile may use OMH interview/research capabilities to resolve uncertainty.
+
+Definition of Done includes:
+
+- stable requirement IDs,
+- explicit acceptance criteria,
+- roles/permissions,
+- MVP vs Later vs Out of Scope,
+- risks and assumptions,
+- requirement trace nodes,
+- authoritative TTF Product Spec handoff.
+
+OMH notes are supporting evidence, not the Product Spec by themselves.
+
+## 6. Architecture Phase
+
+The `architect` Profile may use OMH research/planning, but must produce:
+
+- ADR IDs,
+- component/data/API boundaries,
+- auth/RBAC/security model,
+- shared Decision Packet,
+- deterministic verification plan,
+- residual risks,
+- requirement→ADR traceability.
+
+Engineering fan-out should not begin while shared decisions are contradictory.
+
+## 7. Engineering Phase
+
+Each engineering work package must include a validated TTF Company Task Contract.
+
+OMH may organize work and select/prepare a coding-owner handoff. The selected coding owner performs implementation.
+
+The normal implementation lifecycle is:
+
+```text
+Implement
+  ↓
+run deterministic verification
+  ↓
+kanban_request_review(reviewer="qa-reviewer")
+  ↓
+Hermes native review
+  ├─ approve → done
+  └─ request_changes → original implementer → re-review
+```
+
+Do not use the legacy TTF transition engine for ordinary feedback and do not create a second review-child lane for the same implementation phase.
+
+## 8. Integration
+
+Integration is a meaningful work package, not merely a merge action. It verifies cross-component contracts and uses the same native implementation review lifecycle.
+
+Only reviewed/done implementation packages should release integration work.
+
+## 9. Integrated QA + Security
+
+This is a separate company gate. It is not the same as implementation code review.
+
+Review at least:
+
+- requirement acceptance coverage,
+- regression/failure paths,
+- RBAC/authorization boundaries,
+- secrets handling,
+- injection/deserialization surfaces,
+- dependency/supply-chain risk where relevant,
+- audit behavior,
+- untested/residual risk.
+
+OMH `ulw-qa` may be used as an adversarial evidence generator. Its success does not automatically mark this company gate passed.
+
+## 10. Release Evidence
+
+The `release-manager` checks:
+
+- CI/tests pass with actual evidence,
+- independent review is satisfied,
+- integrated QA/Security accepted,
+- zero unresolved Critical/High findings under default policy,
+- Requirement → ADR → Task → Commit → PR → Test → Release coverage,
+- residual risks declared,
+- human-gated actions remain unperformed without approval.
+
+The release target for the pilot is **Release Candidate**, not production.
+
+## 11. Company Closeout
+
+The orchestrator calls TTF traceability and release-gate tools and records company metrics.
+
+A green Kanban board alone is insufficient. A green OMH QA result alone is insufficient. A coding owner saying "done" alone is insufficient.
+
+## 12. Legacy Boards
+
+If an older board still uses:
+
+```text
+review child → generic block → ttf_review comment → TTF transition engine
+```
+
+migrate it separately. Do not enable legacy autopilot on a new pilot merely because the compatibility script still exists.
+
+## 13. Success Criteria
+
+The pilot succeeds when:
+
+- no company authority is accidentally delegated to OMH/Hermes/coding runtime,
+- execution glue is not duplicated,
+- implementation review cycles autonomously through native Hermes review,
+- Company Evidence Graph is complete enough for RC,
+- production remains human-gated,
+- TTF core remains independent of Hermes Kanban database internals.

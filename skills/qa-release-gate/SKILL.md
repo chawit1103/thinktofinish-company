@@ -1,35 +1,41 @@
 ---
 name: qa-release-gate
-description: Independently verify changes and release readiness.
-version: 0.2.0
+description: Perform native implementation review and independent company QA/release judgment.
+version: 0.3.0
 author: ThinkToFinish
 license: MIT
-compatibility: Hermes Agent reviewer or release profile with project and CI access.
+compatibility: Hermes Agent native review lifecycle; OMH QA evidence may be consumed.
 metadata:
   category: quality
   layer: company
 ---
 # QA and Release Gate
 
-## When to Use
-Use after implementation/integration and before a release candidate is declared ready.
+## Two Review Levels
 
-## Independent Review
-1. Do not rely on the producer's "done" statement.
-2. Re-read requirements and acceptance criteria.
-3. Inspect the change/diff and verification evidence.
-4. Run or verify deterministic checks appropriate to the project.
-5. Check regression risk and failure-path behavior.
-6. Check security evidence. Critical/high findings must be zero unless policy explicitly changes through a human-approved exception.
-7. Call `ttf_requirement_coverage` and identify missing requirement → task → PR → test → release paths.
-8. Construct release evidence and call `ttf_release_gate`.
+### Implementation review
+Inside Hermes same-card review:
+1. Read the original Company Task Contract and accepted Product/Architecture decisions.
+2. Inspect actual change/diff and verification evidence.
+3. Re-run/verify deterministic checks where practical.
+4. Approve with `kanban_complete` only when implementation is satisfactory.
+5. For ordinary rework call `kanban_request_changes(reason=...)`; do not generic-block and do not invoke the legacy TTF transition engine.
 
-## Outcomes
-- `approved`: write the structured `ttf_review` JSON comment, then complete the review card so its children can advance.
-- `release_candidate_ready`: evidence satisfies company policy.
-- `changes_requested`: write a structured `ttf_review` JSON comment with reviewed commit and actionable findings, then use an untyped/generic block. The transition engine creates the remediation/re-review pair and rewires downstream gates.
-- `blocked`: for a retained policy/capability stop, emit no `changes_requested` verdict and use block kind `needs_input` or `capability`.
-- Production remains a separate human-gated action even when a release candidate is ready.
+### Integrated QA/Security company gate
+This is a separate downstream company task. Evaluate system-level acceptance, regression/failure paths, authorization/privacy, secrets, injection/deserialization, dependencies, operational behavior, and residual risk.
 
-## Pitfalls
-Do not turn warnings into invisible risk. Do not waive tests or security because deadlines are tight. Do not approve a release with incomplete traceability unless company policy is explicitly changed by an authorized human.
+OMH `ulw-qa` can generate adversarial evidence, but its result does not automatically pass this gate.
+
+## Release Gate
+1. Verify CI/tests with observed evidence.
+2. Verify independent review state.
+3. Require integrated QA/Security acceptance.
+4. Require zero Critical/High unresolved findings unless policy was explicitly changed through authorized human approval.
+5. Call `ttf_requirement_coverage` and identify missing Requirement → ADR → Task → Commit/PR → Test → Release paths.
+6. Declare residual risk explicitly.
+7. Construct release evidence and call `ttf_release_gate`.
+
+Production remains a separate human-gated action even when Release Candidate evidence passes.
+
+## Evidence Boundary
+A green CI badge, OMH QA success, Hermes task completion, or producer claim is an evidence input, not by itself a release decision.
